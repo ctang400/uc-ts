@@ -75,14 +75,4 @@ private:
   MarketDataMessage msg_;
   std::vector<ShmWriter *> writers_;
   char send_buf_[SHM_ALIGN_SIZE] = {0};
-
-  // 通道统计（本地验证用，on_timer 定期打印）
-  struct ChannelStats {
-    uint64_t trades = 0;
-    uint64_t bbos = 0;
-    uint64_t depths = 0; // DIFF+SNAPSHOT 的 level 条数
-    double last_price = 0;
-  };
-  std::vector<ChannelStats> stats_;
-  Timestamp last_stats_log_ = {};
 };

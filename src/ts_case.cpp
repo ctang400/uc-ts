@@ -26,7 +26,6 @@ void TsCase::init(const ConfigFileParser &parser) {
   INFO("live timer start:{} delta:{}ms", live_timer_.start().to_date_time(),
        live_timer_.delta().msec());
 
-  stats_.resize(uni_.num_symbols());
   for (size_t cid = 0; cid < uni_.num_symbols(); cid++) {
     const auto *rule = uni_.symbol_rule(cid);
     // 与 hft/md/main.cpp 完全一致: /md_{symbol_name}, capacity 1<<14;
@@ -113,8 +112,6 @@ inline void TsCase::onTrade(const MD::Trade &trade) {
   msg_.exchange_time = Timestamp(trade.exchangeTimestamp);
   msg_.is_packet_end = true;
   publish(msg_);
-  stats_[msg_.cid].trades++;
-  stats_[msg_.cid].last_price = msg_.price;
 }
 
 inline void TsCase::onOrderbook(const MD::Orderbook &orderbook) {
@@ -134,7 +131,6 @@ inline void TsCase::onOrderbook(const MD::Orderbook &orderbook) {
     msg_.is_packet_end =
         (idx == orderbook.bids.size() - 1 && orderbook.asks.empty());
     publish(msg_);
-    stats_[msg_.cid].depths++;
     idx++;
   }
   idx = 0;
@@ -144,7 +140,6 @@ inline void TsCase::onOrderbook(const MD::Orderbook &orderbook) {
     msg_.qty = static_cast<double>(s.second);
     msg_.is_packet_end = (idx == orderbook.asks.size() - 1);
     publish(msg_);
-    stats_[msg_.cid].depths++;
     idx++;
   }
 }
@@ -167,25 +162,12 @@ inline void TsCase::onBookTicker(const MD::BookTicker &book_ticker) {
   msg_.is_packet_end = true;
   msg_.side = enums::Side::SELL;
   publish(msg_);
-  stats_[msg_.cid].bbos++;
-  stats_[msg_.cid].last_price = msg_.price;
 }
 
 void TsCase::on_timer(const Timestamp now) {
   // 心跳: reader 1s 无心跳会重连; 100ms tick 刷新绰绰有余
   for (auto *writer : writers_)
     writer->reset_hb(now);
-  // 每 10s 打一行各通道统计(本地验证数据通路)
-  if (last_stats_log_ == Timestamp() ||
-      now >= last_stats_log_ + Duration::from_sec(10)) {
-    for (size_t cid = 0; cid < uni_.num_symbols(); cid++) {
-      const auto &s = stats_[cid];
-      INFO("[md_stats] {} trades:{} bbos:{} depth_levels:{} last_px:{}",
-           uni_.symbol_rule(cid)->symbol_name, s.trades, s.bbos, s.depths,
-           s.last_price);
-    }
-    last_stats_log_ = now;
-  }
 }
 
 void TsCase::onMdLoaderEnd() { INFO("onMdLoaderEnd"); }
