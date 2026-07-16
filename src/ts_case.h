@@ -121,6 +121,6 @@ public:
 
 private:
   std::map<std::string, OrderChannel *> order_channels_; // key = account_str
-  std::string oms_symbol_name_; // sid=0 = symbol list 第一个, "btc-usdt" 形式
+  std::vector<std::string> oms_symbol_names_; // 按 cid, "btc-usdt" 形式
   char rsp_buf_[SHM_ALIGN_SIZE] = {0};
 };

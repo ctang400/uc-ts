@@ -194,13 +194,17 @@ void TsCase::on_timer(const Timestamp now) {
 // ---------------------------------------------------------------------------
 
 void TsCase::init_order_channels() {
-  // sid=0 = 交易 symbol list 第一个; oms 交易 symbol 格式与
+  // 每个 symbol 预生成 oms 交易 symbol 名, 格式与
   // uc-mm/strat/UCTraderMaker_1.cpp 一致: "btc-usdt" (quote-base 小写)
-  const auto *rule0 = uni_.symbol_rule(0);
-  oms_symbol_name_ = enums::Asset::Enum_Name(rule0->quote) + "-" +
-                     enums::Asset::Enum_Name(rule0->base);
-  std::transform(oms_symbol_name_.begin(), oms_symbol_name_.end(),
-                 oms_symbol_name_.begin(), ::tolower);
+  for (size_t cid = 0; cid < uni_.num_symbols(); cid++) {
+    const auto *rule = uni_.symbol_rule(cid);
+    std::string name = enums::Asset::Enum_Name(rule->quote) + "-" +
+                       enums::Asset::Enum_Name(rule->base);
+    std::transform(name.begin(), name.end(), name.begin(), ::tolower);
+    oms_symbol_names_.push_back(name);
+    INFO("sid:{} cid:{} {} oms symbol:{}", rule->sid, cid, rule->symbol_name,
+         name);
+  }
 
   const auto &venues =
       utils::ConfigHelper::getInstance()->getSetting("prod.venues");
@@ -228,9 +232,8 @@ void TsCase::init_order_channels() {
       ch->rsp_writer.connect();
       order_channels_[acc] = ch;
       INFO("order channel account:{} /order_src_{} /order_rsp_{} vendor:{} "
-           "market:{} symbol:{}",
-           acc, ch->account_num, ch->account_num, vendor, market,
-           oms_symbol_name_);
+           "market:{}",
+           acc, ch->account_num, ch->account_num, vendor, market);
     }
   }
   if (order_channels_.empty())
@@ -244,9 +247,15 @@ void TsCase::on_order_msg(OrderChannel &ch, const void *data) {
   switch (header->type) {
   case shm::OrderMsgType::NEW_ORDER: {
     const shm::NewOrder *req = (const shm::NewOrder *)body;
-    if (req->sid != 0) { // 两侧约定 sid 恒为 0, 其他值直接拒单
-      ERROR("account:{} invalid sid:{} oid:{}", ch.account_str, req->sid,
-            req->oid);
+    const auto *rule = uni_.symbol_rule_from_sid(req->sid);
+    // sid 不在 universe 内, 或 symbol 合约类型与通道 venue 的 market 不符
+    // (PERP<->LINEAR / SPOT<->SPOT) 都直接拒单
+    if (rule == NULL ||
+        (ch.oms_header.market == oms::Market::LINEAR
+             ? rule->er.contract_type != enums::ContractType::PERP
+             : rule->er.contract_type != enums::ContractType::SPOT)) {
+      ERROR("account:{} bad sid:{} ({}) oid:{}", ch.account_str, req->sid,
+            rule ? rule->symbol_name : "unknown", req->oid);
       shm::OrderReject rej = {req->oid, 0};
       send_rsp(ch.account_str, shm::OrderMsgType::ORDER_REJECT, &rej,
                sizeof(rej));
@@ -254,7 +263,7 @@ void TsCase::on_order_msg(OrderChannel &ch, const void *data) {
     }
     oms::NewOrder oms_order{};
     oms_order.client_order_id = req->oid;
-    string_to_char_array(oms_symbol_name_, oms_order.symbol);
+    string_to_char_array(oms_symbol_names_[rule->cid], oms_order.symbol);
     oms_order.price = req->price;
     oms_order.qty = req->qty;
     oms_order.side = (oms::Side)req->side;
