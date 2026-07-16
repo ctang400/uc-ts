@@ -6,7 +6,21 @@
 
 #include "ts_case.h"
 
+#include "utils/config_helper.h"
+#include "utils/misc.h"
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
+
+namespace {
+// ResponseHeader.account_id 是定长 char[32], 不保证以 '\0' 结尾
+inline std::string account_str(const oms::ResponseHeader &header) {
+  return std::string(header.account_id,
+                     strnlen(header.account_id, sizeof(header.account_id)));
+}
+// order_id / trade_id 是数字字符串(binance), 转 uint64; 非数字得 0
+inline uint64_t id_to_u64(const char *id) { return strtoull(id, nullptr, 10); }
+} // namespace
 
 void TsCase::init(const ConfigFileParser &parser) {
   const auto sys_config_file =
@@ -30,9 +44,12 @@ void TsCase::init(const ConfigFileParser &parser) {
     const auto *rule = uni_.symbol_rule(cid);
     // 与 hft/md/main.cpp 完全一致: /md_{symbol_name}, capacity 1<<14;
     // hft 侧 ShmMDSession 以 "md_"+symbol_name 打开同一对象。
-    writers_.push_back(new ShmWriter("/md_" + rule->symbol_name, 1 << 14));
+    writers_.push_back(
+        new ShmWriter("/md_" + rule->symbol_name, SHM_MD_CAPACITY));
     writers_[cid]->connect();
   }
+
+  init_order_channels();
 
   requestMdLoader();
 }
@@ -168,6 +185,189 @@ void TsCase::on_timer(const Timestamp now) {
   // 心跳: reader 1s 无心跳会重连; 100ms tick 刷新绰绰有余
   for (auto *writer : writers_)
     writer->reset_hb(now);
+  for (auto &[id, ch] : order_channels_)
+    ch->rsp_writer.reset_hb(now);
+}
+
+// ---------------------------------------------------------------------------
+// 下单通道
+// ---------------------------------------------------------------------------
+
+void TsCase::init_order_channels() {
+  // sid=0 = 交易 symbol list 第一个; oms 交易 symbol 格式与
+  // uc-mm/strat/UCTraderMaker_1.cpp 一致: "btc-usdt" (quote-base 小写)
+  const auto *rule0 = uni_.symbol_rule(0);
+  oms_symbol_name_ = enums::Asset::Enum_Name(rule0->quote) + "-" +
+                     enums::Asset::Enum_Name(rule0->base);
+  std::transform(oms_symbol_name_.begin(), oms_symbol_name_.end(),
+                 oms_symbol_name_.begin(), ::tolower);
+
+  const auto &venues =
+      utils::ConfigHelper::getInstance()->getSetting("prod.venues");
+  for (int i = 0; i < venues.getLength(); i++) {
+    const auto &venue = venues[i];
+    const int vendor = venue["vendor"];
+    const int market = venue["market"];
+    const auto &accounts = venue["accounts"];
+    for (int j = 0; j < accounts.getLength(); j++) {
+      const char *acc_c = accounts[j]["account_id"];
+      const std::string acc(acc_c);
+      // 通道名 /order_src_{N} 要求数字账户; 非数字(如 bn_spot_account1)跳过
+      if (acc.empty() ||
+          acc.find_first_not_of("0123456789") != std::string::npos) {
+        WARNING("account_id:{} not numeric, no order channel", acc);
+        continue;
+      }
+      if (order_channels_.count(acc))
+        TW("duplicated account_id:{} in prod.venues", acc);
+      auto *ch = new OrderChannel(this, acc, std::stoull(acc));
+      ch->oms_header.vendor = (oms::Vendor)vendor;
+      ch->oms_header.market = (oms::Market)market;
+      string_to_char_array(acc, ch->oms_header.account_id);
+      ch->src_reader.connect();
+      ch->rsp_writer.connect();
+      order_channels_[acc] = ch;
+      INFO("order channel account:{} /order_src_{} /order_rsp_{} vendor:{} "
+           "market:{} symbol:{}",
+           acc, ch->account_num, ch->account_num, vendor, market,
+           oms_symbol_name_);
+    }
+  }
+  if (order_channels_.empty())
+    WARNING("no numeric account in prod.venues, order channel disabled");
+}
+
+void TsCase::on_order_msg(OrderChannel &ch, const void *data) {
+  const shm::Header *header = (const shm::Header *)data;
+  const char *body = (const char *)data + sizeof(shm::Header);
+  auto &oms = getOrderManager(ch.oms_header.vendor, ch.oms_header.market);
+  switch (header->type) {
+  case shm::OrderMsgType::NEW_ORDER: {
+    const shm::NewOrder *req = (const shm::NewOrder *)body;
+    if (req->sid != 0) { // 两侧约定 sid 恒为 0, 其他值直接拒单
+      ERROR("account:{} invalid sid:{} oid:{}", ch.account_str, req->sid,
+            req->oid);
+      shm::OrderReject rej = {req->oid, 0};
+      send_rsp(ch.account_str, shm::OrderMsgType::ORDER_REJECT, &rej,
+               sizeof(rej));
+      break;
+    }
+    oms::NewOrder oms_order{};
+    oms_order.client_order_id = req->oid;
+    string_to_char_array(oms_symbol_name_, oms_order.symbol);
+    oms_order.price = req->price;
+    oms_order.qty = req->qty;
+    oms_order.side = (oms::Side)req->side;
+    oms_order.type = oms::OrderType::LIMIT;
+    oms_order.tif = req->order_type == enums::OrderType::GTX
+                        ? oms::OrderTif::GTX
+                        : oms::OrderTif::GTC;
+    if (req->reduce_only)
+      oms_order.option_type |= oms::REQ_OPTION_REDUCE_ONLY_ORDER;
+    // req->recv_window_ms: 目前 pandora 下单不设置 recv_window, 只透传不使用
+    oms.sendOrder(&ch.oms_header, &oms_order);
+  } break;
+  case shm::OrderMsgType::CANCEL_ORDER: {
+    const shm::CancelOrder *req = (const shm::CancelOrder *)body;
+    oms.cancelOrder(req->oid);
+  } break;
+  default:
+    ERROR("account:{} invalid order msg type:{}", ch.account_str,
+          (int)header->type);
+    break;
+  }
+}
+
+void TsCase::send_rsp(const std::string &account_id, uint8_t type,
+                      const void *body, size_t body_len) {
+  auto it = order_channels_.find(account_id);
+  if (it == order_channels_.end()) {
+    // 其他账户(未开通道)的回报直接丢弃
+    DEBUG("rsp type:{} for unknown account:{}, dropped", (int)type,
+          account_id);
+    return;
+  }
+  shm::Header *header = (shm::Header *)rsp_buf_;
+  header->type = type;
+  header->seqnum = it->second->rsp_seqnum++;
+  memcpy(rsp_buf_ + sizeof(shm::Header), body, body_len);
+  it->second->rsp_writer.write(rsp_buf_, sizeof(shm::Header) + body_len);
+}
+
+void TsCase::onOrderAcked(const oms::ResponseHeader &header,
+                          const oms::OrderUpdate &msg) {
+  shm::Ack ack = {msg.client_order_id, id_to_u64(msg.order_id)};
+  send_rsp(account_str(header), shm::OrderMsgType::ACK, &ack, sizeof(ack));
+}
+
+void TsCase::onOrderCanceled(const oms::ResponseHeader &header,
+                             const oms::OrderUpdate &msg) {
+  shm::Canceled cxl = {msg.client_order_id};
+  send_rsp(account_str(header), shm::OrderMsgType::CANCELED, &cxl,
+           sizeof(cxl));
+}
+
+void TsCase::onOrderExpired(const oms::ResponseHeader &header,
+                            const oms::OrderUpdate &msg) {
+  // 与 uc-mm 一致: EXPIRED 按 CANCELED 处理
+  shm::Canceled cxl = {msg.client_order_id};
+  send_rsp(account_str(header), shm::OrderMsgType::CANCELED, &cxl,
+           sizeof(cxl));
+}
+
+void TsCase::onOrderFilled(const oms::ResponseHeader &header,
+                           const oms::OrderUpdate &msg) {
+  shm::Fill fill = {};
+  fill.oid = msg.client_order_id;
+  fill.tid = id_to_u64(msg.trade_id);
+  fill.filled_price = static_cast<double>(msg.last_fill_price);
+  fill.filled_size = static_cast<double>(msg.last_fill_qty);
+  fill.filled = static_cast<double>(msg.filled); // pandora 提供累计成交量
+  fill.is_maker = (msg.liq == oms::Liquidity::MAKER);
+  send_rsp(account_str(header), shm::OrderMsgType::FILL, &fill, sizeof(fill));
+}
+
+void TsCase::onOrderRejected(const oms::ResponseHeader &header,
+                             const oms::ErrorMsg &msg) {
+  // 错误码映射与 uc-mm/strat/oms_test_case.cpp 一致
+  shm::OrderReject rej = {msg.client_order_id, 0};
+  if (msg.exchange_error_code == -5022) // GTX post-only 被吃, 预期行为不打日志
+    rej.reason = enums::ErrorCode::MKT_REJECT_FAIL_EXECUTED_AS_MAKER;
+  else {
+    ERROR("new order[{}] reject: internal ec:{} exchange ec:{} internal "
+          "reason:{} exchange reason:{}",
+          msg.client_order_id, msg.internal_error_code, msg.exchange_error_code,
+          msg.internal_error_msg, msg.exchange_error_msg);
+    if (msg.exchange_error_code == -1008)
+      rej.reason = enums::ErrorCode::MKT_REJECT_MARKET_DOWN;
+  }
+  send_rsp(account_str(header), shm::OrderMsgType::ORDER_REJECT, &rej,
+           sizeof(rej));
+}
+
+void TsCase::onCancelRejected(const oms::ResponseHeader &header,
+                              const oms::ErrorMsg &msg) {
+  shm::CancelReject rej = {msg.client_order_id, 0};
+  if (msg.exchange_error_code == -2011) // 订单不存在, 多为已成交
+    rej.reason = enums::ErrorCode::CXL_REJECT_ORDER_NOT_FOUND;
+  else {
+    if (msg.exchange_error_code == -1008)
+      rej.reason = enums::ErrorCode::MKT_REJECT_MARKET_DOWN;
+    ERROR("cxl order[{}] reject: internal ec:{} exchange ec:{} internal "
+          "reason:{} exchange reason:{}",
+          msg.client_order_id, msg.internal_error_code, msg.exchange_error_code,
+          msg.internal_error_msg, msg.exchange_error_msg);
+  }
+  send_rsp(account_str(header), shm::OrderMsgType::CANCEL_REJECT, &rej,
+           sizeof(rej));
+}
+
+void TsCase::onUnifiedErrorResp(const oms::ResponseHeader &header,
+                                const oms::ErrorMsg &msg) {
+  ERROR("unified error[{}]: internal ec:{} exchange ec:{} internal reason:{} "
+        "exchange reason:{}",
+        msg.client_order_id, msg.internal_error_code, msg.exchange_error_code,
+        msg.internal_error_msg, msg.exchange_error_msg);
 }
 
 void TsCase::onMdLoaderEnd() { INFO("onMdLoaderEnd"); }
