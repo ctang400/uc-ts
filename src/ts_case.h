@@ -114,6 +114,7 @@ public:
     };
     std::string account_str; // cfg 里的 account_id 原文(如 "001"), 即通道名后缀
     bool online = false;     // src 通道心跳新鲜 => 策略在线
+    uint64_t last_session = 0; // src writer 的 incarnation, 变化 = 策略重启
     SrcProc proc;
     ShmReader<SrcProc> src_reader;
     ShmWriter rsp_writer;

@@ -222,8 +222,20 @@ void TsCase::on_timer(const Timestamp now) {
   for (auto &[id, ch] : order_channels_) {
     ch->rsp_writer.reset_hb(now);
     // 策略上线探测: 策略侧 ShmTrader 每 1s 刷 order_src 心跳;
-    // 3s 内有心跳视为在线, 离线->在线的沿触发快照排期
+    // 3s 内有心跳视为在线, 离线->在线的沿触发快照排期。
+    // session(incarnation) 变化 = 策略快速重启(心跳来不及变陈旧), 同样
+    // 视为上线沿补发快照。
     const uint64_t hb = ch->src_reader.heartbeat();
+    const uint64_t sess = ch->src_reader.session();
+    const bool restarted =
+        ch->last_session != 0 && sess != 0 && sess != ch->last_session;
+    if (sess != 0)
+      ch->last_session = sess;
+    if (restarted) {
+      WARNING("strategy account:{} restarted (session change)",
+              ch->account_str);
+      ch->online = false; // 走下面的上线沿逻辑重新排期快照
+    }
     const bool online = hb != 0 && now < Timestamp(hb) + Duration::from_sec(3);
     if (online && !ch->online) {
       // 不立即发: 等下一整秒, 同窗口上线的多个策略合并成一次广播
