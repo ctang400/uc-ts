@@ -266,14 +266,15 @@ void TsCase::init_order_channels() {
     const auto &venue = venues[i];
     const int vendor = venue["vendor"];
     const int market = venue["market"];
-    // restrict_type 缺失 / 0 / 1 的 venue 不做交易转发, 整组账户跳过
+    // pandora RestrictType: 0=NORMAL(不限制) 1=MD(禁行情自动订阅)
+    // 2=OMS(禁交易) 3=MD_OMS(全禁)。只有可交易的 venue(缺失/0/1)才建
+    // order channel; 2/3 禁了交易, 建了也发不出单。
     int restrict_type = 0;
-    if (!venue.lookupValue("restrict_type", restrict_type) ||
-        restrict_type == 0 || restrict_type == 1) {
-      INFO("venue vendor:{} market:{} restrict_type:{} -> no order channel",
-           vendor, market,
-           venue.exists("restrict_type") ? std::to_string(restrict_type)
-                                         : "missing");
+    venue.lookupValue("restrict_type", restrict_type);
+    if (restrict_type >= 2) {
+      INFO("venue vendor:{} market:{} restrict_type:{} (OMS restricted) -> "
+           "no order channel",
+           vendor, market, restrict_type);
       continue;
     }
     const auto &accounts = venue["accounts"];
