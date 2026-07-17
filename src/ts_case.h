@@ -14,6 +14,7 @@
 #include "oms/order_manager.h"
 #include "strat/strategy_base.h"
 #include <common/ConfigFileParser.h>
+#include <common/LevelBook.h>
 #include <common/LiveTimer.h>
 #include <common/MarketDataMessage.h>
 #include <common/ShmBCast.h>
@@ -91,10 +92,16 @@ private:
   void send_rsp(const std::string &account_id, uint8_t type, const void *body,
                 size_t body_len);
 
+  void write_quote(size_t cid, uint8_t type, double price, double qty,
+                   uint8_t side, bool is_packet_end, int64_t exchange_time);
+  void send_snapshots(const Timestamp now);
+
   Universe uni_;
   LiveTimer<this_type> live_timer_;
   MarketDataMessage msg_;
   std::vector<ShmWriter *> writers_;
+  std::vector<LevelBook *> books_; // 本地簿: 新策略上线时重放 SNAPSHOT
+  Timestamp snapshot_due_;         // 非零 = 已排期, 到下一整秒发送
   char send_buf_[SHM_ALIGN_SIZE] = {0};
 
 public:
@@ -106,6 +113,7 @@ public:
       void on_read(const void *data) { ts->on_order_msg(*ch, data); }
     };
     std::string account_str; // cfg 里的 account_id 原文(如 "001"), 即通道名后缀
+    bool online = false;     // src 通道心跳新鲜 => 策略在线
     SrcProc proc;
     ShmReader<SrcProc> src_reader;
     ShmWriter rsp_writer;

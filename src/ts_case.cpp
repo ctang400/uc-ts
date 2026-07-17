@@ -47,6 +47,7 @@ void TsCase::init(const ConfigFileParser &parser) {
     writers_.push_back(
         new ShmWriter("/md_" + rule->symbol_name, SHM_MD_CAPACITY));
     writers_[cid]->connect();
+    books_.push_back(new LevelBook(cid, uni_));
   }
 
   init_order_channels();
@@ -85,31 +86,64 @@ TsCase::translate_symbol_name(Exchange::Vendor vendor, Exchange::Market market,
   return symbol_name;
 }
 
+void TsCase::write_quote(size_t cid, uint8_t type, double price, double qty,
+                         uint8_t side, bool is_packet_end,
+                         int64_t exchange_time) {
+  shm::Header *header = (shm::Header *)send_buf_;
+  header->type = type;
+  shm::Quote *body = (shm::Quote *)(send_buf_ + sizeof(shm::Header));
+  body->price = price;
+  body->qty = qty;
+  body->side = side;
+  body->exchange_time = exchange_time;
+  body->is_packet_end = is_packet_end;
+  writers_[cid]->write(send_buf_, sizeof(shm::Header) + sizeof(shm::Quote));
+}
+
 void TsCase::publish(const MarketDataMessage &msg) {
   switch (msg.type) {
   case enums::EventType::TRADE:
   case enums::EventType::BBO:
   case enums::EventType::DIFF:
   case enums::EventType::SNAPSHOT: {
-    shm::Header *header = (shm::Header *)send_buf_;
-    header->type = msg.type;
-    shm::Quote *body = (shm::Quote *)(send_buf_ + sizeof(shm::Header));
-    body->price = msg.price;
-    body->qty = msg.qty;
-    body->side = msg.side;
-    body->exchange_time = msg.exchange_time.nsec();
-    body->is_packet_end = msg.is_packet_end;
-    writers_[msg.cid]->write(send_buf_,
-                             sizeof(shm::Header) + sizeof(shm::Quote));
+    write_quote(msg.cid, msg.type, msg.price, msg.qty, msg.side,
+                msg.is_packet_end, msg.exchange_time.nsec());
+    // 本地簿与转发流保持一致, 供新上线策略的 SNAPSHOT 重放
+    books_[msg.cid]->book_message(msg);
   } break;
   case enums::EventType::CLEAR: {
     shm::Header *header = (shm::Header *)send_buf_;
     header->type = msg.type;
     writers_[msg.cid]->write(send_buf_, sizeof(shm::Header));
+    books_[msg.cid]->book_message(msg);
   } break;
   default:
     ERROR("invalid message type:{}", (int)msg.type);
     break;
+  }
+}
+
+// 从本地簿向所有 md 通道重放 SNAPSHOT(与交易所快照同构, 策略端 LevelBook
+// 幂等重建)。空簿跳过 —— 宁可让策略再等周期快照, 不发误导性的空簿。
+void TsCase::send_snapshots(const Timestamp now) {
+  using namespace enums::Side;
+  for (size_t cid = 0; cid < uni_.num_symbols(); cid++) {
+    const auto &bids = books_[cid]->levels(BUY);
+    const auto &asks = books_[cid]->levels(SELL);
+    if (bids.empty() || asks.empty()) {
+      WARNING("snapshot skip {}: local book empty",
+              uni_.symbol_rule(cid)->symbol_name);
+      continue;
+    }
+    for (auto it = bids.begin(); it != bids.end(); ++it)
+      write_quote(cid, enums::EventType::SNAPSHOT, it->first,
+                  it->second.total_size(), BUY, false, now.nsec());
+    for (auto it = asks.begin(); it != asks.end(); ++it)
+      write_quote(cid, enums::EventType::SNAPSHOT, it->first,
+                  it->second.total_size(), SELL,
+                  std::next(it) == asks.end(), now.nsec());
+    INFO("snapshot sent {}: {} bids {} asks",
+         uni_.symbol_rule(cid)->symbol_name, bids.size(), asks.size());
   }
 }
 
@@ -182,11 +216,29 @@ inline void TsCase::onBookTicker(const MD::BookTicker &book_ticker) {
 }
 
 void TsCase::on_timer(const Timestamp now) {
-  // 心跳: reader 1s 无心跳会重连; 100ms tick 刷新绰绰有余
+  // 心跳: md/rsp writer 每 100ms tick 刷新
   for (auto *writer : writers_)
     writer->reset_hb(now);
-  for (auto &[id, ch] : order_channels_)
+  for (auto &[id, ch] : order_channels_) {
     ch->rsp_writer.reset_hb(now);
+    // 策略上线探测: 策略侧 ShmTrader 每 1s 刷 order_src 心跳;
+    // 3s 内有心跳视为在线, 离线->在线的沿触发快照排期
+    const uint64_t hb = ch->src_reader.heartbeat();
+    const bool online = hb != 0 && now < Timestamp(hb) + Duration::from_sec(3);
+    if (online && !ch->online) {
+      // 不立即发: 等下一整秒, 同窗口上线的多个策略合并成一次广播
+      if (snapshot_due_ == Timestamp())
+        snapshot_due_ = Timestamp((now.nsec() / 1000000000LL + 1) * 1000000000LL);
+      INFO("strategy account:{} online, snapshot due {}", ch->account_str,
+           snapshot_due_.to_date_time());
+    } else if (!online && ch->online)
+      WARNING("strategy account:{} offline", ch->account_str);
+    ch->online = online;
+  }
+  if (snapshot_due_ != Timestamp() && now >= snapshot_due_) {
+    snapshot_due_ = Timestamp();
+    send_snapshots(now);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -292,7 +344,7 @@ void TsCase::on_order_msg(OrderChannel &ch, const void *data) {
   const char *body = (const char *)data + sizeof(shm::Header);
   auto &oms = getOrderManager(ch.oms_header.vendor, ch.oms_header.market);
   switch (header->type) {
-  case shm::OrderMsgType::NEW_ORDER: {
+  case enums::EventType::NEW_ORDER: {
     const shm::NewOrder *req = (const shm::NewOrder *)body;
     const auto *rule = uni_.symbol_rule_from_sid(req->sid);
     // sid 不在 universe 内, 或 symbol 合约类型与通道 venue 的 market 不符
@@ -304,7 +356,7 @@ void TsCase::on_order_msg(OrderChannel &ch, const void *data) {
       ERROR("account:{} bad sid:{} ({}) oid:{}", ch.account_str, req->sid,
             rule ? rule->symbol_name : "unknown", req->oid);
       shm::OrderReject rej = {req->oid, 0};
-      send_rsp(ch.account_str, shm::OrderMsgType::ORDER_REJECT, &rej,
+      send_rsp(ch.account_str, enums::EventType::ORDER_REJECT, &rej,
                sizeof(rej));
       break;
     }
@@ -323,7 +375,7 @@ void TsCase::on_order_msg(OrderChannel &ch, const void *data) {
     // req->recv_window_ms: 目前 pandora 下单不设置 recv_window, 只透传不使用
     oms.sendOrder(&ch.oms_header, &oms_order);
   } break;
-  case shm::OrderMsgType::CANCEL_ORDER: {
+  case enums::EventType::CANCEL_ORDER: {
     const shm::CancelOrder *req = (const shm::CancelOrder *)body;
     oms.cancelOrder(req->oid);
   } break;
@@ -353,13 +405,13 @@ void TsCase::send_rsp(const std::string &account_id, uint8_t type,
 void TsCase::onOrderAcked(const oms::ResponseHeader &header,
                           const oms::OrderUpdate &msg) {
   shm::Ack ack = {msg.client_order_id, id_to_u64(msg.order_id)};
-  send_rsp(account_str(header), shm::OrderMsgType::ACK, &ack, sizeof(ack));
+  send_rsp(account_str(header), enums::EventType::ACK, &ack, sizeof(ack));
 }
 
 void TsCase::onOrderCanceled(const oms::ResponseHeader &header,
                              const oms::OrderUpdate &msg) {
   shm::Canceled cxl = {msg.client_order_id};
-  send_rsp(account_str(header), shm::OrderMsgType::CANCELED, &cxl,
+  send_rsp(account_str(header), enums::EventType::CANCELED, &cxl,
            sizeof(cxl));
 }
 
@@ -367,7 +419,7 @@ void TsCase::onOrderExpired(const oms::ResponseHeader &header,
                             const oms::OrderUpdate &msg) {
   // 与 uc-mm 一致: EXPIRED 按 CANCELED 处理
   shm::Canceled cxl = {msg.client_order_id};
-  send_rsp(account_str(header), shm::OrderMsgType::CANCELED, &cxl,
+  send_rsp(account_str(header), enums::EventType::CANCELED, &cxl,
            sizeof(cxl));
 }
 
@@ -380,7 +432,7 @@ void TsCase::onOrderFilled(const oms::ResponseHeader &header,
   fill.filled_size = static_cast<double>(msg.last_fill_qty);
   fill.filled = static_cast<double>(msg.filled); // pandora 提供累计成交量
   fill.is_maker = (msg.liq == oms::Liquidity::MAKER);
-  send_rsp(account_str(header), shm::OrderMsgType::FILL, &fill, sizeof(fill));
+  send_rsp(account_str(header), enums::EventType::FILL, &fill, sizeof(fill));
 }
 
 void TsCase::onOrderRejected(const oms::ResponseHeader &header,
@@ -397,7 +449,7 @@ void TsCase::onOrderRejected(const oms::ResponseHeader &header,
     if (msg.exchange_error_code == -1008)
       rej.reason = enums::ErrorCode::MKT_REJECT_MARKET_DOWN;
   }
-  send_rsp(account_str(header), shm::OrderMsgType::ORDER_REJECT, &rej,
+  send_rsp(account_str(header), enums::EventType::ORDER_REJECT, &rej,
            sizeof(rej));
 }
 
@@ -414,7 +466,7 @@ void TsCase::onCancelRejected(const oms::ResponseHeader &header,
           msg.client_order_id, msg.internal_error_code, msg.exchange_error_code,
           msg.internal_error_msg, msg.exchange_error_msg);
   }
-  send_rsp(account_str(header), shm::OrderMsgType::CANCEL_REJECT, &rej,
+  send_rsp(account_str(header), enums::EventType::CANCEL_REJECT, &rej,
            sizeof(rej));
 }
 
