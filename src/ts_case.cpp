@@ -206,25 +206,35 @@ void TsCase::init_order_channels() {
          name);
   }
 
+  validate_universe_in_cfg();
+
   const auto &venues =
       utils::ConfigHelper::getInstance()->getSetting("prod.venues");
   for (int i = 0; i < venues.getLength(); i++) {
     const auto &venue = venues[i];
     const int vendor = venue["vendor"];
     const int market = venue["market"];
+    // restrict_type 缺失 / 0 / 1 的 venue 不做交易转发, 整组账户跳过
+    int restrict_type = 0;
+    if (!venue.lookupValue("restrict_type", restrict_type) ||
+        restrict_type == 0 || restrict_type == 1) {
+      INFO("venue vendor:{} market:{} restrict_type:{} -> no order channel",
+           vendor, market,
+           venue.exists("restrict_type") ? std::to_string(restrict_type)
+                                         : "missing");
+      continue;
+    }
     const auto &accounts = venue["accounts"];
     for (int j = 0; j < accounts.getLength(); j++) {
       const char *acc_c = accounts[j]["account_id"];
       const std::string acc(acc_c);
-      // 通道名 /order_src_{N} 要求数字账户; 非数字(如 bn_spot_account1)跳过
-      if (acc.empty() ||
-          acc.find_first_not_of("0123456789") != std::string::npos) {
-        WARNING("account_id:{} not numeric, no order channel", acc);
-        continue;
-      }
+      if (acc.empty())
+        TW("empty account_id in prod.venues vendor:{} market:{}", vendor,
+           market);
+      // 通道名 = account_id 原文, 全局必须唯一
       if (order_channels_.count(acc))
         TW("duplicated account_id:{} in prod.venues", acc);
-      auto *ch = new OrderChannel(this, acc, std::stoull(acc));
+      auto *ch = new OrderChannel(this, acc);
       ch->oms_header.vendor = (oms::Vendor)vendor;
       ch->oms_header.market = (oms::Market)market;
       string_to_char_array(acc, ch->oms_header.account_id);
@@ -233,11 +243,48 @@ void TsCase::init_order_channels() {
       order_channels_[acc] = ch;
       INFO("order channel account:{} /order_src_{} /order_rsp_{} vendor:{} "
            "market:{}",
-           acc, ch->account_num, ch->account_num, vendor, market);
+           acc, acc, acc, vendor, market);
     }
   }
   if (order_channels_.empty())
-    WARNING("no numeric account in prod.venues, order channel disabled");
+    WARNING("no tradable venue (restrict_type>=2) in prod.venues, order "
+            "channel disabled");
+}
+
+// universe 里的每个 symbol 必须能在 cfg 里找到:
+// 1) prod.venues 存在对应 vendor+market 的 venue;
+// 2) prod.modules.md.subscribe.symbols 包含对应的 "btc-usdt" 形式名。
+// 否则该 symbol 的 md 通道会永远空转(订阅缺失)或数据被丢弃, 直接 TW 拒绝启动。
+void TsCase::validate_universe_in_cfg() {
+  auto *helper = utils::ConfigHelper::getInstance();
+  const auto &venues = helper->getSetting("prod.venues");
+  const auto &md_symbols =
+      helper->getSetting("prod.modules.md.subscribe.symbols");
+  for (size_t cid = 0; cid < uni_.num_symbols(); cid++) {
+    const auto *rule = uni_.symbol_rule(cid);
+    if (rule->er.exchange != enums::Exchange::BINANCE)
+      TW("symbol:{} unsupported exchange", rule->symbol_name);
+    const int want_vendor = 0; // BINANCE
+    const int want_market =
+        rule->er.contract_type == enums::ContractType::PERP ? 1 : 0;
+    bool venue_found = false;
+    for (int i = 0; i < venues.getLength() && !venue_found; i++) {
+      const int vendor = venues[i]["vendor"];
+      const int market = venues[i]["market"];
+      venue_found = (vendor == want_vendor && market == want_market);
+    }
+    if (!venue_found)
+      TW("symbol:{} no venue vendor:{} market:{} in prod.venues",
+         rule->symbol_name, want_vendor, want_market);
+    bool md_found = false;
+    for (int i = 0; i < md_symbols.getLength() && !md_found; i++)
+      md_found = (oms_symbol_names_[cid] == (const char *)md_symbols[i]);
+    if (!md_found)
+      TW("symbol:{} ({}) not in prod.modules.md.subscribe.symbols",
+         rule->symbol_name, oms_symbol_names_[cid]);
+    INFO("universe symbol:{} validated (vendor:{} market:{} md:{})",
+         rule->symbol_name, want_vendor, want_market, oms_symbol_names_[cid]);
+  }
 }
 
 void TsCase::on_order_msg(OrderChannel &ch, const void *data) {

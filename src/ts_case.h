@@ -87,6 +87,7 @@ private:
   void publish(const MarketDataMessage &msg);
 
   void init_order_channels();
+  void validate_universe_in_cfg();
   void send_rsp(const std::string &account_id, uint8_t type, const void *body,
                 size_t body_len);
 
@@ -104,19 +105,16 @@ public:
       OrderChannel *ch;
       void on_read(const void *data) { ts->on_order_msg(*ch, data); }
     };
-    std::string account_str;   // cfg 里的原始 account_id (如 "001"), 供 oms 头用
-    uint64_t account_num;      // stoull 后的数字, 决定通道名
+    std::string account_str; // cfg 里的 account_id 原文(如 "001"), 即通道名后缀
     SrcProc proc;
     ShmReader<SrcProc> src_reader;
     ShmWriter rsp_writer;
     oms::RequestHeader oms_header = {};
     uint64_t rsp_seqnum = 0;
-    OrderChannel(TsCase *ts, const std::string &acc_str, uint64_t acc_num)
-        : account_str(acc_str), account_num(acc_num), proc{ts, this},
-          src_reader("/order_src_" + std::to_string(acc_num), &proc,
-                     SHM_ORDER_SRC_CAPACITY),
-          rsp_writer("/order_rsp_" + std::to_string(acc_num),
-                     SHM_ORDER_RSP_CAPACITY) {}
+    OrderChannel(TsCase *ts, const std::string &acc_str)
+        : account_str(acc_str), proc{ts, this},
+          src_reader("/order_src_" + acc_str, &proc, SHM_ORDER_SRC_CAPACITY),
+          rsp_writer("/order_rsp_" + acc_str, SHM_ORDER_RSP_CAPACITY) {}
   };
 
 private:
