@@ -20,6 +20,10 @@ inline std::string account_str(const oms::ResponseHeader &header) {
 }
 // order_id / trade_id 是数字字符串(binance), 转 uint64; 非数字得 0
 inline uint64_t id_to_u64(const char *id) { return strtoull(id, nullptr, 10); }
+// pandora exchange_timestamp 为 ns; shm 回执 update_time 统一用 us
+inline uint64_t rsp_us(const oms::ResponseHeader &h) {
+  return h.exchange_timestamp / 1000;
+}
 } // namespace
 
 void TsCase::init(const ConfigFileParser &parser) {
@@ -417,13 +421,13 @@ void TsCase::send_rsp(const std::string &account_id, uint8_t type,
 
 void TsCase::onOrderAcked(const oms::ResponseHeader &header,
                           const oms::OrderUpdate &msg) {
-  shm::Ack ack = {msg.client_order_id, id_to_u64(msg.order_id)};
+  shm::Ack ack = {msg.client_order_id, id_to_u64(msg.order_id), rsp_us(header)};
   send_rsp(account_str(header), enums::EventType::ACK, &ack, sizeof(ack));
 }
 
 void TsCase::onOrderCanceled(const oms::ResponseHeader &header,
                              const oms::OrderUpdate &msg) {
-  shm::Canceled cxl = {msg.client_order_id};
+  shm::Canceled cxl = {msg.client_order_id, rsp_us(header)};
   send_rsp(account_str(header), enums::EventType::CANCELED, &cxl,
            sizeof(cxl));
 }
@@ -431,7 +435,7 @@ void TsCase::onOrderCanceled(const oms::ResponseHeader &header,
 void TsCase::onOrderExpired(const oms::ResponseHeader &header,
                             const oms::OrderUpdate &msg) {
   // 与 uc-mm 一致: EXPIRED 按 CANCELED 处理
-  shm::Canceled cxl = {msg.client_order_id};
+  shm::Canceled cxl = {msg.client_order_id, rsp_us(header)};
   send_rsp(account_str(header), enums::EventType::CANCELED, &cxl,
            sizeof(cxl));
 }
@@ -446,13 +450,14 @@ void TsCase::onOrderFilled(const oms::ResponseHeader &header,
   fill.filled = static_cast<double>(msg.filled); // pandora 提供累计成交量
   fill.side = (uint8_t)msg.side; // oms::Side 与 enums::Side 同值(BUY=0,SELL=1)
   fill.is_maker = (msg.liq == oms::Liquidity::MAKER);
+  fill.update_time = rsp_us(header);
   send_rsp(account_str(header), enums::EventType::FILL, &fill, sizeof(fill));
 }
 
 void TsCase::onOrderRejected(const oms::ResponseHeader &header,
                              const oms::ErrorMsg &msg) {
   // 错误码映射与 uc-mm/strat/oms_test_case.cpp 一致
-  shm::OrderReject rej = {msg.client_order_id, 0};
+  shm::OrderReject rej = {msg.client_order_id, 0, rsp_us(header)};
   if (msg.exchange_error_code == -5022) // GTX post-only 被吃, 预期行为不打日志
     rej.reason = enums::ErrorCode::MKT_REJECT_FAIL_EXECUTED_AS_MAKER;
   else {
@@ -469,7 +474,7 @@ void TsCase::onOrderRejected(const oms::ResponseHeader &header,
 
 void TsCase::onCancelRejected(const oms::ResponseHeader &header,
                               const oms::ErrorMsg &msg) {
-  shm::CancelReject rej = {msg.client_order_id, 0};
+  shm::CancelReject rej = {msg.client_order_id, 0, rsp_us(header)};
   if (msg.exchange_error_code == -2011) // 订单不存在, 多为已成交
     rej.reason = enums::ErrorCode::CXL_REJECT_ORDER_NOT_FOUND;
   else {
