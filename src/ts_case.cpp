@@ -444,6 +444,7 @@ void TsCase::onOrderFilled(const oms::ResponseHeader &header,
   fill.filled_price = static_cast<double>(msg.last_fill_price);
   fill.filled_size = static_cast<double>(msg.last_fill_qty);
   fill.filled = static_cast<double>(msg.filled); // pandora 提供累计成交量
+  fill.side = (uint8_t)msg.side; // oms::Side 与 enums::Side 同值(BUY=0,SELL=1)
   fill.is_maker = (msg.liq == oms::Liquidity::MAKER);
   send_rsp(account_str(header), enums::EventType::FILL, &fill, sizeof(fill));
 }
