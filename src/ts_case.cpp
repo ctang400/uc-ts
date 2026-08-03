@@ -65,6 +65,7 @@ void TsCase::init(const ConfigFileParser &parser) {
 static_assert((int)Exchange::Vendor::BINANCE == 0, "Vendor enum reordered");
 static_assert((int)Exchange::Vendor::BITGET == 7, "Vendor enum reordered");
 static_assert((int)Exchange::Vendor::IBKR == 11, "Vendor enum reordered");
+static_assert((int)Exchange::Market::MARGIN == 4, "Market enum reordered");
 
 inline const std::string
 TsCase::translate_symbol_name(Exchange::Vendor vendor, Exchange::Market market,
@@ -355,24 +356,30 @@ void TsCase::validate_universe_in_cfg() {
       helper->getSetting("prod.modules.md.subscribe.symbols");
   for (size_t cid = 0; cid < uni_.num_symbols(); cid++) {
     const auto *rule = uni_.symbol_rule(cid);
-    // universe 交易所 -> md 数据来源 venue 的 vendor 序号(Exchange::Vendor):
-    // NYSEARCA 等股票交易所的数据经 IBKR(11) 进来, 只收 md 不接下单通道。
+    // universe 交易所 -> md 数据来源 venue 的 (vendor, market) 序号:
+    // NYSEARCA 等股票交易所的数据经 IBKR(11) 进来, 只收 md 不接下单通道;
+    // 股票类 venue 约定 market=4 (Exchange::Market::MARGIN 槽位), 与
+    // crypto 的 SPOT(0)/LINEAR(1) 不同。
     int want_vendor = -1;
+    int want_market = -1;
     switch (rule->er.exchange) {
     case enums::Exchange::BINANCE:
       want_vendor = (int)Exchange::Vendor::BINANCE;
+      want_market =
+          rule->er.contract_type == enums::ContractType::PERP ? 1 : 0;
       break;
     case enums::Exchange::BITGET:
       want_vendor = (int)Exchange::Vendor::BITGET;
+      want_market =
+          rule->er.contract_type == enums::ContractType::PERP ? 1 : 0;
       break;
     case enums::Exchange::NYSEARCA:
       want_vendor = (int)Exchange::Vendor::IBKR;
+      want_market = (int)Exchange::Market::MARGIN; // 股票 venue 固定 4
       break;
     default:
       TW("symbol:{} unsupported exchange", rule->symbol_name);
     }
-    const int want_market =
-        rule->er.contract_type == enums::ContractType::PERP ? 1 : 0;
     bool venue_found = false;
     for (int i = 0; i < venues.getLength() && !venue_found; i++) {
       const int vendor = venues[i]["vendor"];
