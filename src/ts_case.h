@@ -89,6 +89,12 @@ private:
 
   void init_order_channels();
   void validate_universe_in_cfg();
+  // universe 交易所 -> md 数据来源 venue 的 (vendor, market)
+  std::pair<Exchange::Vendor, Exchange::Market>
+  md_venue(const SymbolRuleExt *rule);
+  // 按 universe 逐 symbol 调 subscribeMd (trade/orderbook/bookticker),
+  // 取代 cfg prod.modules.md.subscribe.symbols 的静态订阅
+  void subscribe_md_from_universe();
   void send_rsp(const std::string &account_id, uint8_t type, const void *body,
                 size_t body_len);
 

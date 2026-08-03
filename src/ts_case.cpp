@@ -57,7 +57,55 @@ void TsCase::init(const ConfigFileParser &parser) {
 
   init_order_channels();
 
+  // md 订阅由 universe 驱动(subscribeMd), 不再依赖 cfg 的静态 symbols 列表
+  subscribe_md_from_universe();
+
   requestMdLoader();
+}
+
+// universe 交易所 -> md 数据来源 venue 的 (vendor, market):
+// 股票交易所(NYSEARCA 等)的数据经 IBKR 进来且约定 market=MARGIN(4);
+// crypto 按合约类型取 LINEAR/SPOT。validate 与订阅共用此映射。
+std::pair<Exchange::Vendor, Exchange::Market>
+TsCase::md_venue(const SymbolRuleExt *rule) {
+  const auto market = rule->er.contract_type == enums::ContractType::PERP
+                          ? Exchange::Market::LINEAR
+                          : Exchange::Market::SPOT;
+  switch (rule->er.exchange) {
+  case enums::Exchange::BINANCE:
+    return {Exchange::Vendor::BINANCE, market};
+  case enums::Exchange::BITGET:
+    return {Exchange::Vendor::BITGET, market};
+  case enums::Exchange::NYSEARCA:
+    return {Exchange::Vendor::IBKR, Exchange::Market::MARGIN};
+  default:
+    TW("symbol:{} unsupported exchange", rule->symbol_name);
+  }
+  return {Exchange::Vendor::BINANCE, market}; // unreachable (TW throws)
+}
+
+// 逐 symbol 订阅 trade/orderbook/bookticker 三个 topic;
+// symbol 为 "quote-base" 小写(oms_symbol_names_, 与 oms 交易名同构)。
+// 任一订阅失败(返回 nullopt)直接 TW: 缺流的 md 通道会永远空转, 宁可拒绝启动。
+void TsCase::subscribe_md_from_universe() {
+  static const std::pair<MD::TopicType, const char *> kTopics[] = {
+      {MD::TopicType::Trade, "trade"},
+      {MD::TopicType::Orderbook, "orderbook"},
+      {MD::TopicType::BookTicker, "bookticker"},
+  };
+  for (size_t cid = 0; cid < uni_.num_symbols(); cid++) {
+    const auto *rule = uni_.symbol_rule(cid);
+    const auto [vendor, market] = md_venue(rule);
+    for (const auto &[topic, topic_name] : kTopics) {
+      const auto tid =
+          subscribeMd(vendor, market, topic, oms_symbol_names_[cid]);
+      if (!tid)
+        TW("subscribeMd failed: {} vendor:{} market:{} topic:{}",
+           rule->symbol_name, (int)vendor, (int)market, topic_name);
+      INFO("subscribeMd {} vendor:{} market:{} topic:{} -> topic_id:{}",
+           oms_symbol_names_[cid], (int)vendor, (int)market, topic_name, *tid);
+    }
+  }
 }
 
 // cfg prod.venues 里的 vendor 字段是字面量整数, 与 Exchange::Vendor 枚举序号
@@ -345,41 +393,18 @@ void TsCase::init_order_channels() {
             "channel disabled");
 }
 
-// universe 里的每个 symbol 必须能在 cfg 里找到:
-// 1) prod.venues 存在对应 vendor+market 的 venue;
-// 2) prod.modules.md.subscribe.symbols 包含对应的 "btc-usdt" 形式名。
-// 否则该 symbol 的 md 通道会永远空转(订阅缺失)或数据被丢弃, 直接 TW 拒绝启动。
+// universe 里的每个 symbol 在 prod.venues 必须有对应 vendor+market 的 venue,
+// 否则 md agent 无会话可用, 直接 TW 拒绝启动。
+// (md 订阅本身已改为 subscribe_md_from_universe 按 universe 显式发起,
+//  不再校验 cfg 的 prod.modules.md.subscribe.symbols 列表。)
 void TsCase::validate_universe_in_cfg() {
   auto *helper = utils::ConfigHelper::getInstance();
   const auto &venues = helper->getSetting("prod.venues");
-  const auto &md_symbols =
-      helper->getSetting("prod.modules.md.subscribe.symbols");
   for (size_t cid = 0; cid < uni_.num_symbols(); cid++) {
     const auto *rule = uni_.symbol_rule(cid);
-    // universe 交易所 -> md 数据来源 venue 的 (vendor, market) 序号:
-    // NYSEARCA 等股票交易所的数据经 IBKR(11) 进来, 只收 md 不接下单通道;
-    // 股票类 venue 约定 market=4 (Exchange::Market::MARGIN 槽位), 与
-    // crypto 的 SPOT(0)/LINEAR(1) 不同。
-    int want_vendor = -1;
-    int want_market = -1;
-    switch (rule->er.exchange) {
-    case enums::Exchange::BINANCE:
-      want_vendor = (int)Exchange::Vendor::BINANCE;
-      want_market =
-          rule->er.contract_type == enums::ContractType::PERP ? 1 : 0;
-      break;
-    case enums::Exchange::BITGET:
-      want_vendor = (int)Exchange::Vendor::BITGET;
-      want_market =
-          rule->er.contract_type == enums::ContractType::PERP ? 1 : 0;
-      break;
-    case enums::Exchange::NYSEARCA:
-      want_vendor = (int)Exchange::Vendor::IBKR;
-      want_market = (int)Exchange::Market::MARGIN; // 股票 venue 固定 4
-      break;
-    default:
-      TW("symbol:{} unsupported exchange", rule->symbol_name);
-    }
+    const auto [want_vendor_e, want_market_e] = md_venue(rule);
+    const int want_vendor = (int)want_vendor_e;
+    const int want_market = (int)want_market_e;
     bool venue_found = false;
     for (int i = 0; i < venues.getLength() && !venue_found; i++) {
       const int vendor = venues[i]["vendor"];
@@ -389,12 +414,6 @@ void TsCase::validate_universe_in_cfg() {
     if (!venue_found)
       TW("symbol:{} no venue vendor:{} market:{} in prod.venues",
          rule->symbol_name, want_vendor, want_market);
-    bool md_found = false;
-    for (int i = 0; i < md_symbols.getLength() && !md_found; i++)
-      md_found = (oms_symbol_names_[cid] == (const char *)md_symbols[i]);
-    if (!md_found)
-      TW("symbol:{} ({}) not in prod.modules.md.subscribe.symbols",
-         rule->symbol_name, oms_symbol_names_[cid]);
     INFO("universe symbol:{} validated (vendor:{} market:{} md:{})",
          rule->symbol_name, want_vendor, want_market, oms_symbol_names_[cid]);
   }
