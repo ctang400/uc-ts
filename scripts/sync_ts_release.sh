@@ -14,10 +14,10 @@
 #      RUNPATH, 平铺后其相互依赖同样就地解析, 无需再 patch。
 #   3. 本地 ldd 校验: 所有非系统依赖必须解析进 staging 目录, 否则中止。
 #   4. rsync 到 <host>:~/ucts_releases/ucts_<yyyymmdd>_<hash>/。
-#   5. 远端原子换 symlink: ~/ucts/bin -> 该 release 目录(旧的真实 bin 目录
+#   5. 远端原子换 symlink: ~/ts/bin -> 该 release 目录(旧的真实 bin 目录
 #      自动挪到 bin.pre_release.<ts> 备份); 再跑一遍远端 ldd 校验。
 #
-# 回滚 = 在 prod 上把 ~/ucts/bin 重新 ln -sfnT 到上一个 release 目录
+# 回滚 = 在 prod 上把 ~/ts/bin 重新 ln -sfnT 到上一个 release 目录
 # (脚本会在换链前打印当前指向, 便于记录)。
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -89,18 +89,18 @@ rsync -a "$STG/" "$HOST:~/ucts_releases/$REL/"
 # ---- 5. 远端换链 + 校验 ------------------------------------------------------
 ssh "$HOST" REL="$REL" 'bash -s' <<'REMOTE'
 set -euo pipefail
-mkdir -p ~/ucts
+mkdir -p ~/ts
 # 旧指向留档(回滚线索); 首次部署时把真实 bin 目录挪开
-if [ -L ~/ucts/bin ]; then
-  echo "previous release: $(readlink ~/ucts/bin)"
-elif [ -e ~/ucts/bin ]; then
-  bak=~/ucts/bin.pre_release.$(date +%s)
-  echo "first release deploy: mv ~/ucts/bin -> $bak"
-  mv ~/ucts/bin "$bak"
+if [ -L ~/ts/bin ]; then
+  echo "previous release: $(readlink ~/ts/bin)"
+elif [ -e ~/ts/bin ]; then
+  bak=~/ts/bin.pre_release.$(date +%s)
+  echo "first release deploy: mv ~/ts/bin -> $bak"
+  mv ~/ts/bin "$bak"
 fi
-ln -sfnT ~/ucts_releases/"$REL" ~/ucts/bin
+ln -sfnT ~/ucts_releases/"$REL" ~/ts/bin
 # 远端校验: 无 not found, 且非系统依赖全部来自本 release 目录
-cd ~/ucts/bin
+cd ~/ts/bin
 if ldd ./ucts | grep "not found"; then echo "ERROR: 缺依赖"; exit 1; fi
 LEAK=$(ldd ./ucts | awk '/=>/ && $3 ~ /^\// {print $3}' \
   | grep -vE '^/lib/|^/lib64/|^/usr/lib/' \
@@ -108,6 +108,6 @@ LEAK=$(ldd ./ucts | awk '/=>/ && $3 ~ /^\// {print $3}' \
 if [ -n "$LEAK" ]; then
   echo "ERROR: 以下依赖泄漏到发布目录之外:"; echo "$LEAK"; exit 1
 fi
-echo "remote ldd check OK; ~/ucts/bin -> $(readlink ~/ucts/bin)"
+echo "remote ldd check OK; ~/ts/bin -> $(readlink ~/ts/bin)"
 REMOTE
-echo "done: $HOST ~/ucts/bin -> ~/ucts_releases/$REL"
+echo "done: $HOST ~/ts/bin -> ~/ucts_releases/$REL"
