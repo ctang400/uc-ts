@@ -67,6 +67,13 @@ TsCase::translate_symbol_name(Exchange::Vendor vendor, Exchange::Market market,
   case Exchange::Vendor::BINANCE:
     symbol_name += "BINANCE";
     break;
+  case Exchange::Vendor::BITGET:
+    symbol_name += "BITGET";
+    break;
+  case Exchange::Vendor::IBKR:
+    // 股票 symbol 体系(无 quote/base 结构、市场后缀不适用)暂不接入:
+    // 返回空串, 调用方 uni_.cid("") == INVALID_CID 直接跳过该消息。
+    return "";
   default:
     TW("invalid vendor:{}", vendor);
   }
@@ -81,7 +88,8 @@ TsCase::translate_symbol_name(Exchange::Vendor vendor, Exchange::Market market,
     TW("invalid market:{}", market);
   }
   symbol_name += "_";
-  if (vendor == Exchange::Vendor::BINANCE) {
+  if (vendor == Exchange::Vendor::BINANCE ||
+      vendor == Exchange::Vendor::BITGET) {
     symbol_name += symbol;
     std::replace(symbol_name.begin(), symbol_name.end(), '-', '_');
     std::transform(symbol_name.begin(), symbol_name.end(), symbol_name.begin(),
