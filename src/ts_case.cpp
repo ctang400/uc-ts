@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_map>
 
 namespace {
 // ResponseHeader.account_id 是定长 char[32], 不保证以 '\0' 结尾
@@ -59,6 +60,12 @@ void TsCase::init(const ConfigFileParser &parser) {
   requestMdLoader();
 }
 
+// cfg prod.venues 里的 vendor 字段是字面量整数, 与 Exchange::Vendor 枚举序号
+// 必须一致; 上游若在枚举中间插入/重排会静默错位, 用 static_assert 钉死。
+static_assert((int)Exchange::Vendor::BINANCE == 0, "Vendor enum reordered");
+static_assert((int)Exchange::Vendor::BITGET == 7, "Vendor enum reordered");
+static_assert((int)Exchange::Vendor::IBKR == 11, "Vendor enum reordered");
+
 inline const std::string
 TsCase::translate_symbol_name(Exchange::Vendor vendor, Exchange::Market market,
                               const Exchange::Symbol &symbol) {
@@ -70,10 +77,19 @@ TsCase::translate_symbol_name(Exchange::Vendor vendor, Exchange::Market market,
   case Exchange::Vendor::BITGET:
     symbol_name += "BITGET";
     break;
-  case Exchange::Vendor::IBKR:
-    // 股票 symbol 体系(无 quote/base 结构、市场后缀不适用)暂不接入:
-    // 返回空串, 调用方 uni_.cid("") == INVALID_CID 直接跳过该消息。
-    return "";
+  case Exchange::Vendor::IBKR: {
+    // 股票: ticker 可能来自不同交易所(NYSE Arca/NASDAQ/...), 无法像 crypto
+    // 一样从 vendor+market 机械拼出 —— 用硬编码映射逐个接入。未收录的
+    // ticker 返回空串, 调用方 uni_.cid("")==INVALID_CID 直接跳过。
+    // IBKR 数据当前只做接收与翻译(md 转发), 不接下单通道。
+    static const std::unordered_map<std::string, std::string> stock_map = {
+        {"soxl-usd", "NYSEARCA_SPOT_SOXL_USD"},
+    };
+    std::string ticker(symbol);
+    std::transform(ticker.begin(), ticker.end(), ticker.begin(), ::tolower);
+    const auto iter = stock_map.find(ticker);
+    return iter == stock_map.end() ? "" : iter->second;
+  }
   default:
     TW("invalid vendor:{}", vendor);
   }
@@ -339,9 +355,22 @@ void TsCase::validate_universe_in_cfg() {
       helper->getSetting("prod.modules.md.subscribe.symbols");
   for (size_t cid = 0; cid < uni_.num_symbols(); cid++) {
     const auto *rule = uni_.symbol_rule(cid);
-    if (rule->er.exchange != enums::Exchange::BINANCE)
+    // universe 交易所 -> md 数据来源 venue 的 vendor 序号(Exchange::Vendor):
+    // NYSEARCA 等股票交易所的数据经 IBKR(11) 进来, 只收 md 不接下单通道。
+    int want_vendor = -1;
+    switch (rule->er.exchange) {
+    case enums::Exchange::BINANCE:
+      want_vendor = (int)Exchange::Vendor::BINANCE;
+      break;
+    case enums::Exchange::BITGET:
+      want_vendor = (int)Exchange::Vendor::BITGET;
+      break;
+    case enums::Exchange::NYSEARCA:
+      want_vendor = (int)Exchange::Vendor::IBKR;
+      break;
+    default:
       TW("symbol:{} unsupported exchange", rule->symbol_name);
-    const int want_vendor = 0; // BINANCE
+    }
     const int want_market =
         rule->er.contract_type == enums::ContractType::PERP ? 1 : 0;
     bool venue_found = false;
