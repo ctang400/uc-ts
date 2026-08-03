@@ -14,8 +14,8 @@
 #      RUNPATH, 平铺后其相互依赖同样就地解析, 无需再 patch。
 #   3. 本地 ldd 校验: 所有非系统依赖必须解析进 staging 目录, 否则中止。
 #   4. rsync 到 <host>:~/ucts_releases/ucts_<yyyymmdd>_<hash>/。
-#   5. 远端原子换 symlink: ~/ts/bin -> 该 release 目录(旧的真实 bin 目录
-#      自动挪到 bin.pre_release.<ts> 备份); 再跑一遍远端 ldd 校验。
+#   5. 远端换 symlink: ~/ts/bin -> 该 release 目录(已存在的真实 bin 目录
+#      直接删除, 不备份); 再跑一遍远端 ldd 校验。
 #
 # 回滚 = 在 prod 上把 ~/ts/bin 重新 ln -sfnT 到上一个 release 目录
 # (脚本会在换链前打印当前指向, 便于记录)。
@@ -90,13 +90,12 @@ rsync -a "$STG/" "$HOST:~/ucts_releases/$REL/"
 ssh "$HOST" REL="$REL" 'bash -s' <<'REMOTE'
 set -euo pipefail
 mkdir -p ~/ts
-# 旧指向留档(回滚线索); 首次部署时把真实 bin 目录挪开
+# 旧指向打印一下(回滚线索); 真实 bin 目录直接删除, 不备份
 if [ -L ~/ts/bin ]; then
   echo "previous release: $(readlink ~/ts/bin)"
 elif [ -e ~/ts/bin ]; then
-  bak=~/ts/bin.pre_release.$(date +%s)
-  echo "first release deploy: mv ~/ts/bin -> $bak"
-  mv ~/ts/bin "$bak"
+  echo "removing existing ~/ts/bin (no backup)"
+  rm -rf ~/ts/bin
 fi
 ln -sfnT ~/ucts_releases/"$REL" ~/ts/bin
 # 远端校验: 无 not found, 且非系统依赖全部来自本 release 目录
