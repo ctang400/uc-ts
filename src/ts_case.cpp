@@ -449,6 +449,8 @@ void TsCase::on_order_msg(OrderChannel &ch, const void *data) {
     oms_order.type = oms::OrderType::LIMIT;
     oms_order.tif = req->order_type == enums::OrderType::GTX
                         ? oms::OrderTif::GTX
+                    : req->order_type == enums::OrderType::RPI
+                        ? oms::OrderTif::RPI
                         : oms::OrderTif::GTC;
     if (req->reduce_only)
       oms_order.option_type |= oms::REQ_OPTION_REDUCE_ONLY_ORDER;
