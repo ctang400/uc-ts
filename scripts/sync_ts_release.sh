@@ -29,11 +29,13 @@ UCTS=build/ucts
 [ -f "$UCTS" ] || { echo "ERROR: $UCTS not found (先 build)"; exit 1; }
 command -v patchelf >/dev/null || { echo "ERROR: 本机缺 patchelf"; exit 1; }
 
-# release 名: ucts_<日期>_<ucts短hash>[-dirty]
+# release 名: ucts_<日期>_<ucts短hash>[-dirty]_p<pandora短hash>
+# pandora 的 so 一起打包, 版本必须体现在目录名里 —— 同一 ucts hash 配不同
+# pandora 会是两个不同的 release, 否则回滚/对账时分不清。
 HASH=$(git rev-parse --short HEAD)
 git diff --quiet HEAD -- src CMakeLists.txt 2>/dev/null || HASH="${HASH}-dirty"
 PAND_HASH=$(git -C ~/pandora-cpp rev-parse --short HEAD 2>/dev/null || echo unknown)
-REL="ucts_$(date +%Y%m%d)_${HASH}"
+REL="ucts_$(date +%Y%m%d)_${HASH}_p${PAND_HASH}"
 STG=$(mktemp -d)
 trap 'rm -rf "$STG"' EXIT
 
