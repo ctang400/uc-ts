@@ -343,6 +343,7 @@ void TsCase::init_order_channels() {
                        enums::Asset::Enum_Name(rule->base);
     std::transform(name.begin(), name.end(), name.begin(), ::tolower);
     oms_symbol_names_.push_back(name);
+    oms_symbol_to_sid_[name] = rule->sid;
     INFO("sid:{} cid:{} {} oms symbol:{}", rule->sid, cid, rule->symbol_name,
          name);
   }
@@ -535,6 +536,27 @@ void TsCase::onOrderRejected(const oms::ResponseHeader &header,
   }
   send_rsp(account_str(header), enums::EventType::ORDER_REJECT, &rej,
            sizeof(rej));
+}
+
+void TsCase::onPositionUpdate(oms::PositionUpdate *resp) {
+  // resp->header.size = positions 字节数(见 oms/msg.h 注释), 逐条转发。
+  // universe 之外的 symbol(账户里其他持仓)直接跳过, 不打日志避免刷屏。
+  const auto &header = resp->header;
+  const int n = header.size / (int)sizeof(oms::PositionInfo);
+  const std::string acc = account_str(header);
+  for (int i = 0; i < n; i++) {
+    const auto &p = resp->positions[i];
+    std::string sym(p.symbol, strnlen(p.symbol, sizeof(p.symbol)));
+    std::transform(sym.begin(), sym.end(), sym.begin(), ::tolower);
+    const auto it = oms_symbol_to_sid_.find(sym);
+    if (it == oms_symbol_to_sid_.end())
+      continue;
+    const double pos = static_cast<double>(p.position_amt);
+    shm::PositionUpdate pu = {it->second, pos};
+    send_rsp(acc, enums::EventType::POSITION_UPDATE, &pu, sizeof(pu));
+    INFO("position update account:{} {} sid:{} pos:{}", acc, sym, it->second,
+         pos);
+  }
 }
 
 void TsCase::onCancelRejected(const oms::ResponseHeader &header,

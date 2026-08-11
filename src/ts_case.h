@@ -60,6 +60,9 @@ public:
                                 const oms::ErrorMsg &msg) override;
   virtual void onUnifiedErrorResp(const oms::ResponseHeader &header,
                                   const oms::ErrorMsg &msg) override;
+  // 交易所仓位推送(ws position 流) -> 逐 symbol 转发 shm PositionUpdate
+  // 到该账号的回报通道; 需 cfg venue 的 ws_update_options.position = true
+  virtual void onPositionUpdate(oms::PositionUpdate *resp) override;
   virtual void onDataStreamSubscribe(const oms::ResponseHeader &) override {}
   virtual void onSubscribeDisconnected(const oms::ResponseHeader &,
                                        const oms::ErrorMsg &) override {}
@@ -135,5 +138,8 @@ public:
 private:
   std::map<std::string, OrderChannel *> order_channels_; // key = account_str
   std::vector<std::string> oms_symbol_names_; // 按 cid, "btc-usdt" 形式
+  // 反查表: oms symbol 名 -> sid, 供 onPositionUpdate 把交易所 symbol
+  // 翻译回 shm sid(universe 之外的 symbol 查不到即跳过)
+  std::map<std::string, uint64_t> oms_symbol_to_sid_;
   char rsp_buf_[SHM_ALIGN_SIZE] = {0};
 };
