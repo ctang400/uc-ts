@@ -529,10 +529,11 @@ void TsCase::onOrderRejected(const oms::ResponseHeader &header,
   if (msg.exchange_error_code == -5022) // GTX post-only 被吃, 预期行为不打日志
     rej.reason = enums::ErrorCode::MKT_REJECT_FAIL_EXECUTED_AS_MAKER;
   else {
-    ERROR("new order[{}] reject: internal ec:{} exchange ec:{} internal "
-          "reason:{} exchange reason:{}",
-          msg.client_order_id, msg.internal_error_code, msg.exchange_error_code,
-          msg.internal_error_msg, msg.exchange_error_msg);
+    ERROR("account:{} new order[{}] reject: internal ec:{} exchange ec:{} "
+          "internal reason:{} exchange reason:{}",
+          account_str(header), msg.client_order_id, msg.internal_error_code,
+          msg.exchange_error_code, msg.internal_error_msg,
+          msg.exchange_error_msg);
     if (msg.exchange_error_code == -1008)
       rej.reason = enums::ErrorCode::MKT_REJECT_MARKET_DOWN;
   }
@@ -570,10 +571,11 @@ void TsCase::onCancelRejected(const oms::ResponseHeader &header,
   else {
     if (msg.exchange_error_code == -1008)
       rej.reason = enums::ErrorCode::MKT_REJECT_MARKET_DOWN;
-    ERROR("cxl order[{}] reject: internal ec:{} exchange ec:{} internal "
-          "reason:{} exchange reason:{}",
-          msg.client_order_id, msg.internal_error_code, msg.exchange_error_code,
-          msg.internal_error_msg, msg.exchange_error_msg);
+    ERROR("account:{} cxl order[{}] reject: internal ec:{} exchange ec:{} "
+          "internal reason:{} exchange reason:{}",
+          account_str(header), msg.client_order_id, msg.internal_error_code,
+          msg.exchange_error_code, msg.internal_error_msg,
+          msg.exchange_error_msg);
   }
   send_rsp(account_str(header), enums::EventType::CANCEL_REJECT, &rej,
            sizeof(rej));
@@ -581,10 +583,11 @@ void TsCase::onCancelRejected(const oms::ResponseHeader &header,
 
 void TsCase::onUnifiedErrorResp(const oms::ResponseHeader &header,
                                 const oms::ErrorMsg &msg) {
-  ERROR("unified error[{}]: internal ec:{} exchange ec:{} internal reason:{} "
-        "exchange reason:{}",
-        msg.client_order_id, msg.internal_error_code, msg.exchange_error_code,
-        msg.internal_error_msg, msg.exchange_error_msg);
+  ERROR("account:{} unified error[{}]: internal ec:{} exchange ec:{} "
+        "internal reason:{} exchange reason:{}",
+        account_str(header), msg.client_order_id, msg.internal_error_code,
+        msg.exchange_error_code, msg.internal_error_msg,
+        msg.exchange_error_msg);
 }
 
 void TsCase::onMdLoaderEnd() { INFO("onMdLoaderEnd"); }
