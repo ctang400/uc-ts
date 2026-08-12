@@ -138,8 +138,9 @@ public:
 private:
   std::map<std::string, OrderChannel *> order_channels_; // key = account_str
   std::vector<std::string> oms_symbol_names_; // 按 cid, "btc-usdt" 形式
-  // 反查表: oms symbol 名 -> sid, 供 onPositionUpdate 把交易所 symbol
-  // 翻译回 shm sid(universe 之外的 symbol 查不到即跳过)
+  // 反查表: "<vendor>:<market>:<oms symbol>" -> sid, 供 onPositionUpdate 把
+  // 交易所 symbol 翻译回 shm sid。key 必须带 venue —— 同一交易对的 PERP 与
+  // SPOT 的 oms 名相同(如 eth-usdt), 只按名字会互相覆盖(strat004 事故)。
   std::map<std::string, uint64_t> oms_symbol_to_sid_;
   char rsp_buf_[SHM_ALIGN_SIZE] = {0};
 };

@@ -343,7 +343,9 @@ void TsCase::init_order_channels() {
                        enums::Asset::Enum_Name(rule->base);
     std::transform(name.begin(), name.end(), name.begin(), ::tolower);
     oms_symbol_names_.push_back(name);
-    oms_symbol_to_sid_[name] = rule->sid;
+    const auto [md_vendor, md_market] = md_venue(rule);
+    oms_symbol_to_sid_[fmt::format("{}:{}:{}", (int)md_vendor, (int)md_market,
+                                   name)] = rule->sid;
     INFO("sid:{} cid:{} {} oms symbol:{}", rule->sid, cid, rule->symbol_name,
          name);
   }
@@ -548,7 +550,8 @@ void TsCase::onPositionUpdate(oms::PositionUpdate *resp) {
     const auto &p = resp->positions[i];
     std::string sym(p.symbol, strnlen(p.symbol, sizeof(p.symbol)));
     std::transform(sym.begin(), sym.end(), sym.begin(), ::tolower);
-    const auto it = oms_symbol_to_sid_.find(sym);
+    const auto it = oms_symbol_to_sid_.find(fmt::format(
+        "{}:{}:{}", (int)header.vendor, (int)header.market, sym));
     if (it == oms_symbol_to_sid_.end())
       continue;
     const double pos = static_cast<double>(p.position_amt);
