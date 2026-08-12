@@ -566,7 +566,13 @@ void TsCase::onPositionUpdate(oms::PositionUpdate *resp) {
 void TsCase::onCancelRejected(const oms::ResponseHeader &header,
                               const oms::ErrorMsg &msg) {
   shm::CancelReject rej = {msg.client_order_id, 0, rsp_us(header)};
-  if (msg.exchange_error_code == -2011) // 订单不存在, 多为已成交
+  // 订单不存在(多为已成交/已撤/回报丢失)。判据优先用 pandora 的内部统一码
+  // -3005 "order not found" —— 交易所无关; 各交易所原始码作为补充:
+  // binance -2011 Unknown order sent / -2013 Order does not exist,
+  // bitget 25204 Order does not exist。(实测 jp004: 内部 -3005 覆盖全部 3260
+  // 次拒单, 而旧代码只认 -2011, 导致策略侧 reason 恒为 0 无法据此清理本地单。)
+  if (msg.internal_error_code == -3005 || msg.exchange_error_code == -2011 ||
+      msg.exchange_error_code == -2013 || msg.exchange_error_code == 25204)
     rej.reason = enums::ErrorCode::CXL_REJECT_ORDER_NOT_FOUND;
   else {
     if (msg.exchange_error_code == -1008)
