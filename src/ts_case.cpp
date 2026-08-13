@@ -558,8 +558,10 @@ void TsCase::onPositionUpdate(oms::PositionUpdate *resp) {
     const double pos = static_cast<double>(p.position_amt);
     shm::PositionUpdate pu = {it->second, pos};
     send_rsp(acc, enums::EventType::POSITION_UPDATE, &pu, sizeof(pu));
-    INFO("position update account:{} {} sid:{} pos:{}", acc, sym, it->second,
-         pos);
+    // 仓位推送频率很高(每笔成交/每次结算都推), 逐条打日志会淹没 ts.log;
+    // 策略侧收到后自己会做对账并在不一致时告警, 这里不再打。
+    // INFO("position update account:{} {} sid:{} pos:{}", acc, sym,
+    //      it->second, pos);
   }
 }
 

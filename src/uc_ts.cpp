@@ -26,6 +26,13 @@ int main(int argc, char *argv[]) {
   libnst::Logger::init(parser, "environment", Timestamp::now().to_ndate_str(),
                        false /*live*/);
 
+  // 启动标记: Logger 就绪后立刻打, 早于任何初始化 —— 之前唯一能识别启动的
+  // 是 "bind ucts to cpu", 那是 init() 全部完成之后才打的, 排查重启时间线时
+  // 会把初始化耗时算进停机窗口。
+  INFO("******************************************");
+  INFO("       TradeServer is up");
+  INFO("******************************************");
+
   std::set_terminate([]() {
     const auto &ep = std::current_exception();
     try {
