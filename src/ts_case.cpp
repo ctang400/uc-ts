@@ -234,10 +234,14 @@ inline void TsCase::onTrade(const MD::Trade &trade) {
   // (uc-mm 回测侧同款 filter 已删, 见 uc-mm 8a57b67。)
   // 但按合法性过滤: 实盘 feed 存在 price=0 的非常规 print(原被 r1 filter 顺带
   // 挡掉; 2026-09-01 10:55 SNDK strat006 pnl 瞬间 +7606 = pos×init_px 即由此),
-  // 会污染 OrderManager 标记价与 trade 类信号。
-  if (static_cast<double>(trade.price) <= 0.0 ||
-      static_cast<double>(trade.quantity) <= 0.0)
-    return;
+  // 会污染 OrderManager 标记价与 trade 类信号。浮点不与 0 直接比,
+  // 按 tick 语义判"非正": price < half_price_tick / qty < half_size_tick。
+  {
+    const auto *rule = uni_.symbol_rule(msg_.cid);
+    if (static_cast<double>(trade.price) < rule->half_price_tick ||
+        static_cast<double>(trade.quantity) < rule->half_size_tick)
+      return;
+  }
   msg_.type = enums::EventType::TRADE;
   msg_.price = static_cast<double>(trade.price);
   msg_.qty = static_cast<double>(trade.quantity);
