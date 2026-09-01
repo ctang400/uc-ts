@@ -229,18 +229,24 @@ inline void TsCase::onTrade(const MD::Trade &trade) {
       uni_.cid(translate_symbol_name(trade.vendor, trade.market, trade.symbol));
   if (msg_.cid == Universe::INVALID_CID)
     return;
-  // 不按 r1(成交类型)过滤: RPI 成交也是真实市场成交(只是 maker 挂的 RPI 单),
-  // 且模型训练与 sim 数据都不区分 trade 类型, prod 行情必须同口径全量下发。
-  // (uc-mm 回测侧同款 filter 已删, 见 uc-mm 8a57b67。)
-  // 但按合法性过滤: 实盘 feed 存在 price=0 的非常规 print(原被 r1 filter 顺带
-  // 挡掉; 2026-09-01 10:55 SNDK strat006 pnl 瞬间 +7606 = pos×init_px 即由此),
-  // 会污染 OrderManager 标记价与 trade 类信号。浮点不与 0 直接比,
-  // 按 tick 语义判"非正": price < half_price_tick / qty < half_size_tick。
+  // 币安合约按成交类型过滤: MARKET 与 RPI 都是真实市场成交(RPI 只是 maker
+  // 挂的 RPI 单), 其余(INSUR/ADL/未标注等)丢弃 —— 实盘 feed 的非常规 print
+  // 带 price=0(2026-09-01 10:55 SNDK strat006 pnl 瞬间 +7606 = pos×init_px),
+  // 会污染 OrderManager 标记价与 trade 类信号。
+  if (trade.vendor == oms::Vendor::BINANCE &&
+      trade.market == oms::Market::LINEAR && trade.r1 != "MARKET" &&
+      trade.r1 != "RPI")
+    return;
+  // 合法性兜底: price/qty 低于半个 tick 视为非正, 丢弃并留痕(浮点不与 0 直接比)
   {
     const auto *rule = uni_.symbol_rule(msg_.cid);
     if (static_cast<double>(trade.price) < rule->half_price_tick ||
-        static_cast<double>(trade.quantity) < rule->half_size_tick)
+        static_cast<double>(trade.quantity) < rule->half_size_tick) {
+      WARNING("drop invalid trade {} px:{} qty:{} r1:{}", rule->symbol_name,
+              static_cast<double>(trade.price),
+              static_cast<double>(trade.quantity), trade.r1);
       return;
+    }
   }
   msg_.type = enums::EventType::TRADE;
   msg_.price = static_cast<double>(trade.price);
