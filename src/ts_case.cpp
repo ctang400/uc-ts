@@ -229,9 +229,9 @@ inline void TsCase::onTrade(const MD::Trade &trade) {
       uni_.cid(translate_symbol_name(trade.vendor, trade.market, trade.symbol));
   if (msg_.cid == Universe::INVALID_CID)
     return;
-  if (trade.vendor == oms::Vendor::BINANCE &&
-      trade.market == oms::Market::LINEAR && trade.r1 != "MARKET")
-    return;
+  // 不按 r1(成交类型)过滤: RPI 成交也是真实市场成交(只是 maker 挂的 RPI 单),
+  // 且模型训练与 sim 数据都不区分 trade 类型, prod 行情必须同口径全量下发。
+  // (uc-mm 回测侧同款 filter 已删, 见 uc-mm 8a57b67。)
   msg_.type = enums::EventType::TRADE;
   msg_.price = static_cast<double>(trade.price);
   msg_.qty = static_cast<double>(trade.quantity);
