@@ -232,6 +232,11 @@ inline void TsCase::onTrade(const MD::Trade &trade) {
   // 不按 r1(成交类型)过滤: RPI 成交也是真实市场成交(只是 maker 挂的 RPI 单),
   // 且模型训练与 sim 数据都不区分 trade 类型, prod 行情必须同口径全量下发。
   // (uc-mm 回测侧同款 filter 已删, 见 uc-mm 8a57b67。)
+  // 但按合法性过滤: 实盘 feed 存在 price=0 的非常规 print(原被 r1 filter 顺带
+  // 挡掉; 2026-09-01 10:55 SNDK strat006 pnl 瞬间 +7606 = pos×init_px 即由此),
+  // 会污染 OrderManager 标记价与 trade 类信号。
+  if (trade.price <= 0 || trade.quantity <= 0)
+    return;
   msg_.type = enums::EventType::TRADE;
   msg_.price = static_cast<double>(trade.price);
   msg_.qty = static_cast<double>(trade.quantity);
