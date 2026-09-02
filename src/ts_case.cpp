@@ -601,14 +601,14 @@ void TsCase::onOrderFilled(const oms::ResponseHeader &header,
   fill.update_time = rsp_us(header);
   // sid: 共享账号广播下策略靠它过滤归属(oms symbol -> sid, 带 venue 前缀,
   // 与 onPositionUpdate 同一张反查表)。查不到(非 universe 的 symbol, 例如
-  // 手工单)时置 1: 任何策略的 symbol_rule_from_sid(1) 都是 NULL -> 全部忽略,
-  // 不会把无关成交记进谁的仓位(0 是 legacy 哨兵, 语义是"计入", 不能用)。
+  // 手工单)时置 1: 任何策略的 symbol_rule_from_sid(1) 都是 NULL -> 全部忽略
+  // (0 是 legacy 哨兵, 语义是"计入", 不能用)。side/is_maker 已并入
+  // update_time 的 uint64 位域, 本结构与旧版不兼容, ucts/策略须同批部署。
   std::string fsym(msg.symbol, strnlen(msg.symbol, sizeof(msg.symbol)));
   std::transform(fsym.begin(), fsym.end(), fsym.begin(), ::tolower);
   const auto sit = oms_symbol_to_sid_.find(fmt::format(
       "{}:{}:{}", (int)header.vendor, (int)header.market, fsym));
-  fill.sid_lo32 =
-      sit == oms_symbol_to_sid_.end() ? 1u : (uint32_t)sit->second;
+  fill.sid = sit == oms_symbol_to_sid_.end() ? 1 : sit->second;
   broadcast_rsp(account_str(header), enums::EventType::FILL, &fill, sizeof(fill));
 }
 
