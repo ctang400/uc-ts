@@ -344,6 +344,21 @@ void TsCase::on_timer(const Timestamp now) {
 // ---------------------------------------------------------------------------
 
 void TsCase::init_order_channels() {
+  // 每个 symbol 预生成 oms 交易 symbol 名, 格式与
+  // uc-mm/strat/UCTraderMaker_1.cpp 一致: "btc-usdt" (quote-base 小写)
+  for (size_t cid = 0; cid < uni_.num_symbols(); cid++) {
+    const auto *rule = uni_.symbol_rule(cid);
+    std::string name = enums::Asset::Enum_Name(rule->quote) + "-" +
+                       enums::Asset::Enum_Name(rule->base);
+    std::transform(name.begin(), name.end(), name.begin(), ::tolower);
+    oms_symbol_names_.push_back(name);
+    const auto [md_vendor, md_market] = md_venue(rule);
+    oms_symbol_to_sid_[fmt::format("{}:{}:{}", (int)md_vendor, (int)md_market,
+                                   name)] = rule->sid;
+    INFO("sid:{} cid:{} {} oms symbol:{}", rule->sid, cid, rule->symbol_name,
+         name);
+  }
+
   validate_universe_in_cfg();
 
   // 本实例服务的逻辑 account_id 由 [client] account_ids 显式给出。
