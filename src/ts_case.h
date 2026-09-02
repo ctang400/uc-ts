@@ -144,9 +144,12 @@ public:
 
 private:
   std::map<std::string, OrderChannel *> order_channels_; // key = 虚拟 account_id
-  // account_map.csv: 虚拟 account_id -> 真实 account(多对一)。空 = 无映射,
-  // 全部按 id==account 直连(旧行为)。
+  // account_map.csv(全局公共文件, git 同步): 逻辑 account_id -> 物理 account,
+  // 纯翻译表, 不做与 cfg 的交叉校验。本实例实际服务哪些逻辑 id 由
+  // [client] account_ids= 决定(served_account_ids_)。
   std::map<std::string, std::string> virt2real_;
+  std::vector<std::string> served_account_ids_;
+  // 只含本实例服务的 id: 物理 account -> 关联逻辑 id 列表(回报广播用)
   std::map<std::string, std::vector<std::string>> real2virts_;
   std::vector<std::string> oms_symbol_names_; // 按 cid, "btc-usdt" 形式
   // 反查表: "<vendor>:<market>:<oms symbol>" -> sid, 供 onPositionUpdate 把

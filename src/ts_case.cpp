@@ -344,88 +344,62 @@ void TsCase::on_timer(const Timestamp now) {
 // ---------------------------------------------------------------------------
 
 void TsCase::init_order_channels() {
-  // 每个 symbol 预生成 oms 交易 symbol 名, 格式与
-  // uc-mm/strat/UCTraderMaker_1.cpp 一致: "btc-usdt" (quote-base 小写)
-  for (size_t cid = 0; cid < uni_.num_symbols(); cid++) {
-    const auto *rule = uni_.symbol_rule(cid);
-    std::string name = enums::Asset::Enum_Name(rule->quote) + "-" +
-                       enums::Asset::Enum_Name(rule->base);
-    std::transform(name.begin(), name.end(), name.begin(), ::tolower);
-    oms_symbol_names_.push_back(name);
-    const auto [md_vendor, md_market] = md_venue(rule);
-    oms_symbol_to_sid_[fmt::format("{}:{}:{}", (int)md_vendor, (int)md_market,
-                                   name)] = rule->sid;
-    INFO("sid:{} cid:{} {} oms symbol:{}", rule->sid, cid, rule->symbol_name,
-         name);
-  }
-
   validate_universe_in_cfg();
 
-  // 记录 cfg 里出现过的真实账号, 结束后校验 map 引用的账号都真实存在
-  std::set<std::string> cfg_accounts;
+  // 本实例服务的逻辑 account_id 由 [client] account_ids 显式给出。
+  // 对每个 id: 必须在 account_map 里(TW), 其物理 account 必须在 cfg 的
+  // 可交易 venue 里(TW)。除此之外不做任何多余校验 —— account_map 是全局
+  // 公共翻译表(git 同步, 各服务器同版本), cfg 里多余账号 / map 里多余条目
+  // 都是正常的。
   const auto &venues =
       utils::ConfigHelper::getInstance()->getSetting("prod.venues");
-  for (int i = 0; i < venues.getLength(); i++) {
-    const auto &venue = venues[i];
-    const int vendor = venue["vendor"];
-    const int market = venue["market"];
-    // pandora RestrictType: 0=NORMAL(不限制) 1=MD(禁行情自动订阅)
-    // 2=OMS(禁交易) 3=MD_OMS(全禁)。只有可交易的 venue(缺失/0/1)才建
-    // order channel; 2/3 禁了交易, 建了也发不出单。
-    int restrict_type = 0;
-    venue.lookupValue("restrict_type", restrict_type);
-    if (restrict_type >= 2) {
-      INFO("venue vendor:{} market:{} restrict_type:{} (OMS restricted) -> "
-           "no order channel",
-           vendor, market, restrict_type);
-      continue;
-    }
-    const auto &accounts = venue["accounts"];
-    for (int j = 0; j < accounts.getLength(); j++) {
-      const char *acc_c = accounts[j]["account_id"];
-      const std::string acc(acc_c);
-      if (acc.empty())
-        TW("empty account_id in prod.venues vendor:{} market:{}", vendor,
-           market);
-      cfg_accounts.insert(acc);
-      // cfg 里的是真实账号; 映射表里有它 -> 每个虚拟 account_id 一条通道
-      // (通道名 = 虚拟 id, 下单头 = 真实账号); 没有 -> 单通道, 虚拟==真实。
-      std::vector<std::string> virts;
-      const auto vit = real2virts_.find(acc);
-      if (vit != real2virts_.end())
-        virts = vit->second;
-      else
-        virts = {acc};
-      for (const auto &virt : virts) {
-        // 通道名 = 虚拟 account_id 原文, 全局必须唯一
-        if (order_channels_.count(virt))
-          TW("duplicated (virtual) account_id:{} in prod.venues/account_map",
-             virt);
-        auto *ch = new OrderChannel(this, virt);
-        ch->oms_header.vendor = (oms::Vendor)vendor;
-        ch->oms_header.market = (oms::Market)market;
-        string_to_char_array(acc, ch->oms_header.account_id);
-        ch->src_reader.connect();
-        ch->rsp_writer.connect();
-        order_channels_[virt] = ch;
-        INFO("order channel virt:{} real:{} /order_src_{} /order_rsp_{} "
-             "vendor:{} market:{}",
-             virt, acc, virt, virt, vendor, market);
+  for (const auto &virt : served_account_ids_) {
+    const auto vit = virt2real_.find(virt);
+    if (vit == virt2real_.end())
+      TW("account_ids: {} 不在 account_map 里", virt);
+    const std::string &real = vit->second;
+    // 在 cfg 可交易 venue 里找物理账号, 取其 vendor/market
+    int found_vendor = -1, found_market = -1;
+    for (int i = 0; i < venues.getLength() && found_vendor < 0; i++) {
+      const auto &venue = venues[i];
+      int restrict_type = 0;
+      venue.lookupValue("restrict_type", restrict_type);
+      if (restrict_type >= 2)
+        continue; // OMS 被禁的 venue 不能承载下单通道
+      const auto &accounts = venue["accounts"];
+      for (int j = 0; j < accounts.getLength(); j++) {
+        const char *acc_c = accounts[j]["account_id"];
+        if (real == acc_c) {
+          found_vendor = venue["vendor"];
+          found_market = venue["market"];
+          break;
+        }
       }
     }
+    if (found_vendor < 0)
+      TW("account_ids: {} -> {} 不在任何可交易 venue 的 accounts 里", virt,
+         real);
+    if (order_channels_.count(virt))
+      TW("duplicated account_id:{} in account_ids", virt);
+    auto *ch = new OrderChannel(this, virt);
+    ch->oms_header.vendor = (oms::Vendor)found_vendor;
+    ch->oms_header.market = (oms::Market)found_market;
+    string_to_char_array(real, ch->oms_header.account_id);
+    ch->src_reader.connect();
+    ch->rsp_writer.connect();
+    order_channels_[virt] = ch;
+    real2virts_[real].push_back(virt);
+    INFO("order channel virt:{} real:{} /order_src_{} /order_rsp_{} "
+         "vendor:{} market:{}",
+         virt, real, virt, virt, found_vendor, found_market);
   }
-  // map 引用了 cfg 里不存在的真实账号 = 配置错位, 拒绝启动
-  for (const auto &[real, virts] : real2virts_)
-    if (!cfg_accounts.count(real))
-      TW("account_map: real account {} (virts: {}) not found in prod.venues",
-         real, fmt::format("{}", fmt::join(virts, ",")));
   if (order_channels_.empty())
-    WARNING("no tradable venue (restrict_type>=2) in prod.venues, order "
-            "channel disabled");
+    WARNING("account_ids 为空, order channel disabled");
 }
 
-// account_map.csv: 每行 "virtual_account_id,real_account"; '#' 开头与表头行
-// 跳过。同一虚拟 id 只能映射一次; 文件不存在直接 TW(config-no-defaults)。
+// account_map.csv: 每行 "logical_account_id,physical_account"; '#' 开头与
+// 表头行跳过。全局公共翻译表, 只查表不校验(与 cfg 的交叉检查在
+// init_order_channels 按 account_ids 逐个做)。
 void TsCase::load_account_map(const ConfigFileParser &parser) {
   const auto path =
       parser.get<std::string>("client", "account_map_file");
@@ -450,22 +424,31 @@ void TsCase::load_account_map(const ConfigFileParser &parser) {
     if (virt.empty() || real.empty())
       TW("account_map_file bad line: '{}'", s);
     if (virt2real_.count(virt))
-      TW("account_map_file duplicated virtual account_id: {}", virt);
+      TW("account_map_file duplicated account_id: {}", virt);
     virt2real_[virt] = real;
-    real2virts_[real].push_back(virt);
   }
   fclose(f);
-  for (const auto &[real, virts] : real2virts_)
-    INFO("account_map: real {} <- virts [{}]", real,
-         fmt::format("{}", fmt::join(virts, ",")));
-  if (virt2real_.empty())
-    INFO("account_map: empty (identity mode, 与旧行为一致)");
+  INFO("account_map: {} entries loaded from {}", virt2real_.size(), path);
+
+  // [client] account_ids: 本实例服务的逻辑 id, 逗号分隔; 键必填, 值可为空
+  // (纯 md 实例)。
+  const auto ids =
+      parser.get<std::string>("client", "account_ids");
+  std::string cur;
+  for (const char c : ids + ",") {
+    if (c == ',') {
+      if (!cur.empty())
+        served_account_ids_.push_back(cur);
+      cur.clear();
+    } else if (c != ' ') {
+      cur += c;
+    }
+  }
+  INFO("account_ids: [{}]", fmt::format("{}", fmt::join(served_account_ids_, ",")));
 }
 
 // universe 里的每个 symbol 在 prod.venues 必须有对应 vendor+market 的 venue,
 // 否则 md agent 无会话可用, 直接 TW 拒绝启动。
-// (md 订阅本身已改为 subscribe_md_from_universe 按 universe 显式发起,
-//  不再校验 cfg 的 prod.modules.md.subscribe.symbols 列表。)
 void TsCase::validate_universe_in_cfg() {
   auto *helper = utils::ConfigHelper::getInstance();
   const auto &venues = helper->getSetting("prod.venues");
