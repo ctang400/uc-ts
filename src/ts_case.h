@@ -91,6 +91,9 @@ private:
   void publish(const MarketDataMessage &msg);
 
   void init_order_channels();
+  // [client] account_map_file: 虚拟 account_id -> 真实 account 映射表
+  // (多策略共享同一真实账号, 各自用虚拟 id 命名 shm 通道)。
+  void load_account_map(const ConfigFileParser &parser);
   void validate_universe_in_cfg();
   // universe 交易所 -> md 数据来源 venue 的 (vendor, market)
   std::pair<Exchange::Vendor, Exchange::Market>
@@ -100,6 +103,10 @@ private:
   void subscribe_md_from_universe();
   void send_rsp(const std::string &account_id, uint8_t type, const void *body,
                 size_t body_len);
+  // OMS 回报头里是真实 account: 广播给映射到它的全部虚拟 account_id 通道;
+  // 未映射的账号退化为单通道直发(旧行为)。
+  void broadcast_rsp(const std::string &real_account, uint8_t type,
+                     const void *body, size_t body_len);
 
   void write_quote(size_t cid, uint8_t type, double price, double qty,
                    uint8_t side, bool is_packet_end, int64_t exchange_time);
@@ -136,7 +143,11 @@ public:
   };
 
 private:
-  std::map<std::string, OrderChannel *> order_channels_; // key = account_str
+  std::map<std::string, OrderChannel *> order_channels_; // key = 虚拟 account_id
+  // account_map.csv: 虚拟 account_id -> 真实 account(多对一)。空 = 无映射,
+  // 全部按 id==account 直连(旧行为)。
+  std::map<std::string, std::string> virt2real_;
+  std::map<std::string, std::vector<std::string>> real2virts_;
   std::vector<std::string> oms_symbol_names_; // 按 cid, "btc-usdt" 形式
   // 反查表: "<vendor>:<market>:<oms symbol>" -> sid, 供 onPositionUpdate 把
   // 交易所 symbol 翻译回 shm sid。key 必须带 venue —— 同一交易对的 PERP 与

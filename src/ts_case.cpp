@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <unordered_map>
+#include <set>
 
 namespace {
 // ResponseHeader.account_id 是定长 char[32], 不保证以 '\0' 结尾
@@ -55,6 +56,7 @@ void TsCase::init(const ConfigFileParser &parser) {
     books_.push_back(new LevelBook(cid, uni_));
   }
 
+  load_account_map(parser);
   init_order_channels();
 
   // md 订阅由 universe 驱动(subscribeMd), 不再依赖 cfg 的静态 symbols 列表
@@ -359,6 +361,8 @@ void TsCase::init_order_channels() {
 
   validate_universe_in_cfg();
 
+  // 记录 cfg 里出现过的真实账号, 结束后校验 map 引用的账号都真实存在
+  std::set<std::string> cfg_accounts;
   const auto &venues =
       utils::ConfigHelper::getInstance()->getSetting("prod.venues");
   for (int i = 0; i < venues.getLength(); i++) {
@@ -383,24 +387,79 @@ void TsCase::init_order_channels() {
       if (acc.empty())
         TW("empty account_id in prod.venues vendor:{} market:{}", vendor,
            market);
-      // 通道名 = account_id 原文, 全局必须唯一
-      if (order_channels_.count(acc))
-        TW("duplicated account_id:{} in prod.venues", acc);
-      auto *ch = new OrderChannel(this, acc);
-      ch->oms_header.vendor = (oms::Vendor)vendor;
-      ch->oms_header.market = (oms::Market)market;
-      string_to_char_array(acc, ch->oms_header.account_id);
-      ch->src_reader.connect();
-      ch->rsp_writer.connect();
-      order_channels_[acc] = ch;
-      INFO("order channel account:{} /order_src_{} /order_rsp_{} vendor:{} "
-           "market:{}",
-           acc, acc, acc, vendor, market);
+      cfg_accounts.insert(acc);
+      // cfg 里的是真实账号; 映射表里有它 -> 每个虚拟 account_id 一条通道
+      // (通道名 = 虚拟 id, 下单头 = 真实账号); 没有 -> 单通道, 虚拟==真实。
+      std::vector<std::string> virts;
+      const auto vit = real2virts_.find(acc);
+      if (vit != real2virts_.end())
+        virts = vit->second;
+      else
+        virts = {acc};
+      for (const auto &virt : virts) {
+        // 通道名 = 虚拟 account_id 原文, 全局必须唯一
+        if (order_channels_.count(virt))
+          TW("duplicated (virtual) account_id:{} in prod.venues/account_map",
+             virt);
+        auto *ch = new OrderChannel(this, virt);
+        ch->oms_header.vendor = (oms::Vendor)vendor;
+        ch->oms_header.market = (oms::Market)market;
+        string_to_char_array(acc, ch->oms_header.account_id);
+        ch->src_reader.connect();
+        ch->rsp_writer.connect();
+        order_channels_[virt] = ch;
+        INFO("order channel virt:{} real:{} /order_src_{} /order_rsp_{} "
+             "vendor:{} market:{}",
+             virt, acc, virt, virt, vendor, market);
+      }
     }
   }
+  // map 引用了 cfg 里不存在的真实账号 = 配置错位, 拒绝启动
+  for (const auto &[real, virts] : real2virts_)
+    if (!cfg_accounts.count(real))
+      TW("account_map: real account {} (virts: {}) not found in prod.venues",
+         real, fmt::format("{}", fmt::join(virts, ",")));
   if (order_channels_.empty())
     WARNING("no tradable venue (restrict_type>=2) in prod.venues, order "
             "channel disabled");
+}
+
+// account_map.csv: 每行 "virtual_account_id,real_account"; '#' 开头与表头行
+// 跳过。同一虚拟 id 只能映射一次; 文件不存在直接 TW(config-no-defaults)。
+void TsCase::load_account_map(const ConfigFileParser &parser) {
+  const auto path =
+      parser.get<std::string>("client", "account_map_file");
+  FILE *f = fopen(path.c_str(), "r");
+  if (!f)
+    TW("account_map_file {} not found", path);
+  char line[256];
+  while (fgets(line, sizeof(line), f)) {
+    std::string s(line);
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r' ||
+                          s.back() == ' '))
+      s.pop_back();
+    if (s.empty() || s[0] == '#')
+      continue;
+    const auto comma = s.find(',');
+    if (comma == std::string::npos)
+      TW("account_map_file bad line: '{}'", s);
+    const std::string virt = s.substr(0, comma);
+    const std::string real = s.substr(comma + 1);
+    if (virt == "account_id" || virt == "virtual_account_id") // 表头
+      continue;
+    if (virt.empty() || real.empty())
+      TW("account_map_file bad line: '{}'", s);
+    if (virt2real_.count(virt))
+      TW("account_map_file duplicated virtual account_id: {}", virt);
+    virt2real_[virt] = real;
+    real2virts_[real].push_back(virt);
+  }
+  fclose(f);
+  for (const auto &[real, virts] : real2virts_)
+    INFO("account_map: real {} <- virts [{}]", real,
+         fmt::format("{}", fmt::join(virts, ",")));
+  if (virt2real_.empty())
+    INFO("account_map: empty (identity mode, 与旧行为一致)");
 }
 
 // universe 里的每个 symbol 在 prod.venues 必须有对应 vendor+market 的 venue,
@@ -478,6 +537,20 @@ void TsCase::on_order_msg(OrderChannel &ch, const void *data) {
   }
 }
 
+// 回报广播: OMS ResponseHeader 里的是真实账号 —— 映射表里有它就发给全部
+// 关联的虚拟 account_id 通道(各通道独立 seqnum); 没有则按原名直发(旧行为)。
+// 策略侧按 oid(订单类)/sid(FILL/仓位)自行识别归属, 见 libnst TraderBase。
+void TsCase::broadcast_rsp(const std::string &real_account, uint8_t type,
+                           const void *body, size_t body_len) {
+  const auto it = real2virts_.find(real_account);
+  if (it == real2virts_.end()) {
+    send_rsp(real_account, type, body, body_len);
+    return;
+  }
+  for (const auto &virt : it->second)
+    send_rsp(virt, type, body, body_len);
+}
+
 void TsCase::send_rsp(const std::string &account_id, uint8_t type,
                       const void *body, size_t body_len) {
   auto it = order_channels_.find(account_id);
@@ -497,13 +570,13 @@ void TsCase::send_rsp(const std::string &account_id, uint8_t type,
 void TsCase::onOrderAcked(const oms::ResponseHeader &header,
                           const oms::OrderUpdate &msg) {
   shm::Ack ack = {msg.client_order_id, id_to_u64(msg.order_id), rsp_us(header)};
-  send_rsp(account_str(header), enums::EventType::ACK, &ack, sizeof(ack));
+  broadcast_rsp(account_str(header), enums::EventType::ACK, &ack, sizeof(ack));
 }
 
 void TsCase::onOrderCanceled(const oms::ResponseHeader &header,
                              const oms::OrderUpdate &msg) {
   shm::Canceled cxl = {msg.client_order_id, rsp_us(header)};
-  send_rsp(account_str(header), enums::EventType::CANCELED, &cxl,
+  broadcast_rsp(account_str(header), enums::EventType::CANCELED, &cxl,
            sizeof(cxl));
 }
 
@@ -511,7 +584,7 @@ void TsCase::onOrderExpired(const oms::ResponseHeader &header,
                             const oms::OrderUpdate &msg) {
   // 与 uc-mm 一致: EXPIRED 按 CANCELED 处理
   shm::Canceled cxl = {msg.client_order_id, rsp_us(header)};
-  send_rsp(account_str(header), enums::EventType::CANCELED, &cxl,
+  broadcast_rsp(account_str(header), enums::EventType::CANCELED, &cxl,
            sizeof(cxl));
 }
 
@@ -526,7 +599,17 @@ void TsCase::onOrderFilled(const oms::ResponseHeader &header,
   fill.side = (uint8_t)msg.side; // oms::Side 与 enums::Side 同值(BUY=0,SELL=1)
   fill.is_maker = (msg.liq == oms::Liquidity::MAKER);
   fill.update_time = rsp_us(header);
-  send_rsp(account_str(header), enums::EventType::FILL, &fill, sizeof(fill));
+  // sid: 共享账号广播下策略靠它过滤归属(oms symbol -> sid, 带 venue 前缀,
+  // 与 onPositionUpdate 同一张反查表)。查不到(非 universe 的 symbol, 例如
+  // 手工单)时置 1: 任何策略的 symbol_rule_from_sid(1) 都是 NULL -> 全部忽略,
+  // 不会把无关成交记进谁的仓位(0 是 legacy 哨兵, 语义是"计入", 不能用)。
+  std::string fsym(msg.symbol, strnlen(msg.symbol, sizeof(msg.symbol)));
+  std::transform(fsym.begin(), fsym.end(), fsym.begin(), ::tolower);
+  const auto sit = oms_symbol_to_sid_.find(fmt::format(
+      "{}:{}:{}", (int)header.vendor, (int)header.market, fsym));
+  fill.sid_lo32 =
+      sit == oms_symbol_to_sid_.end() ? 1u : (uint32_t)sit->second;
+  broadcast_rsp(account_str(header), enums::EventType::FILL, &fill, sizeof(fill));
 }
 
 void TsCase::onOrderRejected(const oms::ResponseHeader &header,
@@ -544,7 +627,7 @@ void TsCase::onOrderRejected(const oms::ResponseHeader &header,
     if (msg.exchange_error_code == -1008)
       rej.reason = enums::ErrorCode::MKT_REJECT_MARKET_DOWN;
   }
-  send_rsp(account_str(header), enums::EventType::ORDER_REJECT, &rej,
+  broadcast_rsp(account_str(header), enums::EventType::ORDER_REJECT, &rej,
            sizeof(rej));
 }
 
@@ -564,7 +647,7 @@ void TsCase::onPositionUpdate(oms::PositionUpdate *resp) {
       continue;
     const double pos = static_cast<double>(p.position_amt);
     shm::PositionUpdate pu = {it->second, pos};
-    send_rsp(acc, enums::EventType::POSITION_UPDATE, &pu, sizeof(pu));
+    broadcast_rsp(acc, enums::EventType::POSITION_UPDATE, &pu, sizeof(pu));
     // 仓位推送频率很高(每笔成交/每次结算都推), 逐条打日志会淹没 ts.log;
     // 策略侧收到后自己会做对账并在不一致时告警, 这里不再打。
     // INFO("position update account:{} {} sid:{} pos:{}", acc, sym,
@@ -590,7 +673,7 @@ void TsCase::onCancelRejected(const oms::ResponseHeader &header,
           msg.exchange_error_code, msg.internal_error_msg,
           msg.exchange_error_msg);
   }
-  send_rsp(account_str(header), enums::EventType::CANCEL_REJECT, &rej,
+  broadcast_rsp(account_str(header), enums::EventType::CANCEL_REJECT, &rej,
            sizeof(rej));
 }
 
