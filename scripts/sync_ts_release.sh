@@ -27,7 +27,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-MACHINES=(001 002 003 004) # 新增机器加在这里
+MACHINES=(001 002 003 004 005) # 新增机器加在这里
 HOST_PREFIX=uc_aws_jp_
 
 NNN=${1:?usage: sync_ts_release.sh <NNN|all> [--stage-only]}
