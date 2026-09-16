@@ -613,7 +613,10 @@ void TsCase::onOrderFilled(const oms::ResponseHeader &header,
 void TsCase::onOrderRejected(const oms::ResponseHeader &header,
                              const oms::ErrorMsg &msg) {
   // 错误码映射与 uc-mm/strat/oms_test_case.cpp 一致
-  shm::OrderReject rej = {msg.client_order_id, 0, rsp_us(header)};
+  // 默认 MKT_REJECT(通用市场拒单), 不再是 OK(0): 策略收到 SENT_REJECTED 时能
+  // 区分"被拒"与"无错误"。已映射的按 pandora 内部统一码(交易所无关)优先。
+  shm::OrderReject rej = {msg.client_order_id, enums::ErrorCode::MKT_REJECT,
+                          rsp_us(header)};
   if (msg.exchange_error_code == -5022) // GTX post-only 被吃, 预期行为不打日志
     rej.reason = enums::ErrorCode::MKT_REJECT_FAIL_EXECUTED_AS_MAKER;
   else {
@@ -622,7 +625,12 @@ void TsCase::onOrderRejected(const oms::ResponseHeader &header,
           account_str(header), msg.client_order_id, msg.internal_error_code,
           msg.exchange_error_code, msg.internal_error_msg,
           msg.exchange_error_msg);
-    if (msg.exchange_error_code == -1008)
+    if (msg.internal_error_code == -3006 || msg.exchange_error_code == -2019)
+      // pandora OMS_ERRNO_BALANCE_NOT_ENOUGH / binance "Margin is insufficient":
+      // 保证金不足。策略侧据此退避, 不要 ms 级重发(jp003 strat008 20260914
+      // 一秒 1625 次拒单重试)。
+      rej.reason = enums::ErrorCode::MKT_REJECT_INSUFFICIENT_MARGIN;
+    else if (msg.exchange_error_code == -1008)
       rej.reason = enums::ErrorCode::MKT_REJECT_MARKET_DOWN;
   }
   broadcast_rsp(account_str(header), enums::EventType::ORDER_REJECT, &rej,
@@ -655,7 +663,8 @@ void TsCase::onPositionUpdate(oms::PositionUpdate *resp) {
 
 void TsCase::onCancelRejected(const oms::ResponseHeader &header,
                               const oms::ErrorMsg &msg) {
-  shm::CancelReject rej = {msg.client_order_id, 0, rsp_us(header)};
+  shm::CancelReject rej = {msg.client_order_id, enums::ErrorCode::MKT_REJECT,
+                           rsp_us(header)}; // 默认 MKT_REJECT, 见 onOrderRejected
   // 订单不存在(多为已成交/已撤/回报丢失): 用 pandora 的内部统一码 -3005
   // "order not found" 判定 —— 交易所无关, 不必逐个维护各交易所原始码。
   // (实测 jp004: 全部 3260 次 not-found 拒单 internal ec 都是 -3005, 而旧代码
